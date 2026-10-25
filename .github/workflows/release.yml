@@ -1,0 +1,86 @@
+# Builds the portable packages (app + ffmpeg, nothing to install) and attaches them to a GitHub
+# release whenever a v* tag is pushed. "Run workflow" builds them without publishing.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+      - name: Build
+        run: python build.py
+      - name: Add ffmpeg
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp
+          $exe = Get-ChildItem ffmpeg_tmp -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          New-Item -ItemType Directory -Force package/LightRec | Out-Null
+          Copy-Item dist/LightRec.exe package/LightRec/
+          Copy-Item $exe.FullName package/LightRec/
+          Copy-Item README.md, LICENSE package/LightRec/
+          Compress-Archive -Path package/LightRec -DestinationPath LightRec-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LightRec-windows-x64
+          path: LightRec-windows-x64.zip
+
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk libportaudio2
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+      - name: Build
+        run: python build.py
+      - name: Add ffmpeg
+        run: |
+          curl -L -o ffmpeg.tar.xz https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
+          mkdir ffmpeg_tmp && tar -xJf ffmpeg.tar.xz -C ffmpeg_tmp
+          mkdir -p package/LightRec
+          cp dist/LightRec package/LightRec/
+          cp "$(find ffmpeg_tmp -name ffmpeg -type f | head -n 1)" package/LightRec/
+          cp README.md LICENSE package/LightRec/
+          chmod +x package/LightRec/LightRec package/LightRec/ffmpeg
+          tar -C package -czf LightRec-linux-x64.tar.gz LightRec
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LightRec-linux-x64
+          path: LightRec-linux-x64.tar.gz
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            LightRec-windows-x64.zip
+            LightRec-linux-x64.tar.gz
+          generate_release_notes: true
