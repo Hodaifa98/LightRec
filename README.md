@@ -46,8 +46,9 @@ Chrome or Discord in the middle of a match changes nothing - the recording just 
 - **Instant replay.** Tick *Keep the last … of gameplay ready to save* and leave LightRec open while
   you play. The last 15, 30, 60 or 120 seconds are held in memory (a few dozen MB, nothing touches
   the disk). `Ctrl+Shift+S`, or the *Save clip* button, writes them to a `LightRec_Clip_….mp4`. A
-  small notice in the corner of the game display confirms it. The setting is remembered, so next
-  time LightRec starts, the buffer starts with it.
+  small notice in the corner of the game display confirms it. Each save empties the buffer, so
+  pressing again five seconds later gives you a five-second clip, not the same thirty seconds twice.
+  The setting is remembered, so next time LightRec starts, the buffer starts with it.
 - **Session recording.** `Ctrl+Shift+R` or *Start recording* records the session to
   `LightRec_Game_….mp4`, for hours if you like. Instant replay keeps working while a session is
   being recorded, both are fed by the same capture. A floating timer shows while recording (it is

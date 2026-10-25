@@ -985,9 +985,7 @@ class App:
             if self._in_game_view():
                 self._set_status("Turn on instant replay first, then Ctrl+Shift+S saves a clip.", warn=True)
             return
-        if self.game.replay.buffered < 1.0:
-            self._set_status("Nothing buffered yet - give it a second.", warn=True)
-            return
+        # No "buffer is empty" check here: the save waits up to a few seconds for the next fragment.
         self.game.save_replay()
         self._set_status("Saving the clip…")
 

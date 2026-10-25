@@ -325,6 +325,15 @@ class ReplayBuffer:
         data = init + b"".join(f[2] for f in chosen)
         return data, chosen[0][0], chosen[-1][0] + chosen[-1][1]
 
+    def forget_before(self, when: float) -> None:
+        """
+        Drop everything already saved, so the next clip starts where this one ended
+        """
+        with self._lock:
+            while self._frags and self._frags[0][0] < when:
+                self.bytes -= len(self._frags[0][2])
+                self._frags.popleft()
+
     def close(self) -> None:
         self.writer.abort()
 
@@ -467,6 +476,8 @@ class GameEngine:
             if piece is None:
                 raise encoder.EncodeError("Nothing is buffered yet - give it a second and try again.")
             data, start, end = piece
+            # The buffer starts over after a save, so two presses never save the same moment twice.
+            replay.forget_before(end)
             stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             os.makedirs(self.config.output_dir, exist_ok=True)
             final = os.path.join(self.config.output_dir, f"LightRec_Clip_{stamp}.mp4")
