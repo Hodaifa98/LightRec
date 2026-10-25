@@ -34,6 +34,8 @@ GW_HWNDPREV = 3
 GWL_EXSTYLE = -20
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_LAYERED = 0x00080000
+WS_EX_TRANSPARENT = 0x00000020
+WS_EX_NOACTIVATE = 0x08000000
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
 DWMWA_CLOAKED = 14
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
@@ -107,6 +109,7 @@ def _setup_prototypes() -> None:
     u.GetWindowTextW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
     u.GetClassNameW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
     u.GetWindowLongW.restype, u.GetWindowLongW.argtypes = wt.LONG, [wt.HWND, ctypes.c_int]
+    u.SetWindowLongW.restype, u.SetWindowLongW.argtypes = wt.LONG, [wt.HWND, ctypes.c_int, wt.LONG]
     u.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
     u.GetCursorInfo.argtypes = [ctypes.POINTER(CURSORINFO)]
     u.GetIconInfo.argtypes = [wt.HICON, ctypes.POINTER(ICONINFO)]
@@ -168,6 +171,18 @@ def exclude_from_capture(hwnd: int) -> bool:
         return bool(user32.SetWindowDisplayAffinity(wt.HWND(hwnd), WDA_EXCLUDEFROMCAPTURE))
     except OSError:
         return False
+
+
+def make_passive(hwnd: int) -> None:
+    """
+    Make a popup click-through and unable to take focus (a toast over a fullscreen game)
+    """
+    try:
+        style = user32.GetWindowLongW(wt.HWND(hwnd), GWL_EXSTYLE)
+        user32.SetWindowLongW(wt.HWND(hwnd), GWL_EXSTYLE,
+                              style | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW)
+    except OSError:
+        pass
 
 
 # Rect is (x, y, w, h).
@@ -656,6 +671,232 @@ class WindowGrabber:
         if self._scratch is not None:
             self._scratch.close()
         self._dib.close()
+
+
+# Tray icon.
+WM_NULL, WM_CLOSE, WM_USER = 0x0000, 0x0010, 0x0400
+WM_LBUTTONUP, WM_LBUTTONDBLCLK, WM_RBUTTONUP = 0x0202, 0x0203, 0x0205
+WM_TRAY = WM_USER + 1
+NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
+NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x1, 0x2, 0x4
+MF_STRING, MF_GRAYED, MF_CHECKED, MF_SEPARATOR = 0x0, 0x1, 0x8, 0x800
+TPM_RIGHTBUTTON, TPM_RETURNCMD, TPM_NONOTIFY = 0x2, 0x100, 0x80
+WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
+
+
+class WNDCLASSW(ctypes.Structure):
+    _fields_ = [("style", wt.UINT), ("lpfnWndProc", WNDPROC), ("cbClsExtra", ctypes.c_int),
+                ("cbWndExtra", ctypes.c_int), ("hInstance", wt.HINSTANCE), ("hIcon", wt.HICON),
+                ("hCursor", wt.HANDLE), ("hbrBackground", wt.HBRUSH), ("lpszMenuName", wt.LPCWSTR),
+                ("lpszClassName", wt.LPCWSTR)]
+
+
+class NOTIFYICONDATAW(ctypes.Structure):
+    _fields_ = [("cbSize", wt.DWORD), ("hWnd", wt.HWND), ("uID", wt.UINT), ("uFlags", wt.UINT),
+                ("uCallbackMessage", wt.UINT), ("hIcon", wt.HICON), ("szTip", wt.WCHAR * 128),
+                ("dwState", wt.DWORD), ("dwStateMask", wt.DWORD), ("szInfo", wt.WCHAR * 256),
+                ("uVersion", wt.UINT), ("szInfoTitle", wt.WCHAR * 64), ("dwInfoFlags", wt.DWORD),
+                ("guidItem", ctypes.c_byte * 16), ("hBalloonIcon", wt.HICON)]
+
+
+def _setup_tray_prototypes() -> None:
+    u, g, k = user32, gdi32, kernel32
+    u.DefWindowProcW.restype = ctypes.c_ssize_t
+    u.DefWindowProcW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+    u.RegisterClassW.restype, u.RegisterClassW.argtypes = wt.ATOM, [ctypes.POINTER(WNDCLASSW)]
+    u.CreateWindowExW.restype = wt.HWND
+    u.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD, ctypes.c_int, ctypes.c_int,
+                                  ctypes.c_int, ctypes.c_int, wt.HWND, wt.HMENU, wt.HINSTANCE, wt.LPVOID]
+    u.DestroyWindow.argtypes = [wt.HWND]
+    u.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+    u.SetForegroundWindow.argtypes = [wt.HWND]
+    u.GetCursorPos.argtypes = [ctypes.POINTER(wt.POINT)]
+    u.CreatePopupMenu.restype = wt.HMENU
+    u.AppendMenuW.argtypes = [wt.HMENU, wt.UINT, ctypes.c_size_t, wt.LPCWSTR]
+    u.DestroyMenu.argtypes = [wt.HMENU]
+    u.TrackPopupMenu.restype = wt.BOOL
+    u.TrackPopupMenu.argtypes = [wt.HMENU, wt.UINT, ctypes.c_int, ctypes.c_int, ctypes.c_int, wt.HWND, wt.LPVOID]
+    u.CreateIconIndirect.restype, u.CreateIconIndirect.argtypes = wt.HICON, [ctypes.POINTER(ICONINFO)]
+    u.DestroyIcon.argtypes = [wt.HICON]
+    u.RegisterWindowMessageW.restype, u.RegisterWindowMessageW.argtypes = wt.UINT, [wt.LPCWSTR]
+    g.CreateBitmap.restype = wt.HBITMAP
+    g.CreateBitmap.argtypes = [ctypes.c_int, ctypes.c_int, wt.UINT, wt.UINT, ctypes.c_void_p]
+    k.GetModuleHandleW.restype, k.GetModuleHandleW.argtypes = wt.HMODULE, [wt.LPCWSTR]
+    ctypes.windll.shell32.Shell_NotifyIconW.restype = wt.BOOL
+    ctypes.windll.shell32.Shell_NotifyIconW.argtypes = [wt.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
+
+
+if IS_WINDOWS:
+    _setup_tray_prototypes()
+
+
+def _hex(color: str) -> tuple[int, int, int]:
+    return int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
+
+
+def make_dot_icon(dot: str, ring: str, size: int = 32) -> int:
+    """
+    Build an HICON of a colored dot inside a dark ring (same look as the window icon)
+    """
+    dr, dg, db = _hex(dot)
+    rr, rg, rb = _hex(ring)
+    c = (size - 1) / 2
+    pixels = bytearray()
+    for y in range(size):
+        for x in range(size):
+            d = ((x - c) ** 2 + (y - c) ** 2) ** 0.5
+            if d < size * 0.28:
+                pixels += bytes((db, dg, dr, 255))
+            elif d < size * 0.47:
+                pixels += bytes((rb, rg, rr, 255))
+            else:
+                pixels += bytes((0, 0, 0, 0))
+    color = gdi32.CreateBitmap(size, size, 1, 32, bytes(pixels))
+    mask = gdi32.CreateBitmap(size, size, 1, 1, bytes(size * size // 8))
+    info = ICONINFO(True, 0, 0, mask, color)
+    icon = user32.CreateIconIndirect(ctypes.byref(info))
+    gdi32.DeleteObject(color)
+    gdi32.DeleteObject(mask)
+    return icon
+
+
+# (id, label, enabled, checked); None is a separator.
+MenuItem = Optional[tuple[int, str, bool, bool]]
+
+
+class TrayIcon(threading.Thread):
+    """
+    Icon next to the clock with a right-click menu, run on its own message loop thread
+    """
+
+    def __init__(self, tooltip: str, on_click: Callable[[], None], on_menu: Callable[[int], None],
+                 menu: Callable[[], list[MenuItem]]):
+        super().__init__(name="lightrec-tray", daemon=True)
+        self._tooltip = tooltip
+        self._on_click, self._on_menu, self._menu = on_click, on_menu, menu
+        self._hwnd = 0
+        self._icon = 0
+        self._ready = threading.Event()
+        self._lock = threading.Lock()
+        # Keep the callback alive for as long as the window exists.
+        self._proc = WNDPROC(self._wndproc)
+        self._taskbar_created = 0
+        self.ok = False
+
+    # Thread.
+    def run(self) -> None:
+        inst = kernel32.GetModuleHandleW(None)
+        cls = WNDCLASSW()
+        cls.lpfnWndProc = self._proc
+        cls.hInstance = inst
+        cls.lpszClassName = "LightRecTray"
+        user32.RegisterClassW(ctypes.byref(cls))
+        self._taskbar_created = user32.RegisterWindowMessageW("TaskbarCreated")
+        self._hwnd = user32.CreateWindowExW(0, "LightRecTray", "LightRec", 0, 0, 0, 0, 0, None, None, inst, None)
+        if not self._hwnd:
+            self._ready.set()
+            return
+        self.ok = bool(self._notify(NIM_ADD))
+        self._ready.set()
+        msg = wt.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+    def _data(self, flags: int) -> NOTIFYICONDATAW:
+        data = NOTIFYICONDATAW()
+        data.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        data.hWnd = self._hwnd
+        data.uID = 1
+        data.uFlags = flags
+        data.uCallbackMessage = WM_TRAY
+        data.hIcon = self._icon
+        data.szTip = self._tooltip[:127]
+        return data
+
+    def _notify(self, action: int) -> bool:
+        with self._lock:
+            data = self._data(NIF_MESSAGE | NIF_ICON | NIF_TIP)
+            return bool(ctypes.windll.shell32.Shell_NotifyIconW(action, ctypes.byref(data)))
+
+    def _wndproc(self, hwnd, msg, wparam, lparam):
+        if msg == WM_TRAY:
+            if lparam in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
+                self._safe(self._on_click)
+            elif lparam == WM_RBUTTONUP:
+                self._popup()
+            return 0
+        if msg == WM_CLOSE:
+            self._notify(NIM_DELETE)
+            user32.DestroyWindow(wt.HWND(hwnd))
+            return 0
+        if msg == 0x0002:
+            # WM_DESTROY.
+            user32.PostQuitMessage(0)
+            return 0
+        if self._taskbar_created and msg == self._taskbar_created:
+            # Explorer restarted, put the icon back.
+            self._notify(NIM_ADD)
+            return 0
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    def _popup(self) -> None:
+        try:
+            items = self._menu()
+        except Exception:
+            return
+        menu = user32.CreatePopupMenu()
+        for item in items:
+            if item is None:
+                user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+                continue
+            mid, label, enabled, checked = item
+            flags = MF_STRING | (0 if enabled else MF_GRAYED) | (MF_CHECKED if checked else 0)
+            user32.AppendMenuW(menu, flags, mid, label)
+        pos = wt.POINT()
+        user32.GetCursorPos(ctypes.byref(pos))
+        # The menu only closes properly when our window is in the foreground (a well-known quirk).
+        user32.SetForegroundWindow(wt.HWND(self._hwnd))
+        chosen = user32.TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY, pos.x, pos.y, 0,
+                                       wt.HWND(self._hwnd), None)
+        user32.PostMessageW(wt.HWND(self._hwnd), WM_NULL, 0, 0)
+        user32.DestroyMenu(menu)
+        if chosen:
+            self._safe(lambda: self._on_menu(int(chosen)))
+
+    @staticmethod
+    def _safe(fn: Callable[[], None]) -> None:
+        try:
+            fn()
+        except Exception:
+            pass
+
+    # Public API (any thread).
+    def wait_ready(self, timeout: float = 2.0) -> None:
+        self._ready.wait(timeout)
+
+    def update(self, tooltip: Optional[str] = None, icon: Optional[int] = None) -> None:
+        """
+        Change the tooltip and/or icon (the old icon is destroyed)
+        """
+        old = 0
+        with self._lock:
+            if tooltip is not None:
+                self._tooltip = tooltip
+            if icon is not None and icon != self._icon:
+                old, self._icon = self._icon, icon
+        if self._hwnd:
+            self._notify(NIM_MODIFY)
+        if old:
+            user32.DestroyIcon(old)
+
+    def stop(self) -> None:
+        if self._hwnd:
+            user32.PostMessageW(wt.HWND(self._hwnd), WM_CLOSE, 0, 0)
+            self.join(timeout=2)
+        if self._icon:
+            user32.DestroyIcon(self._icon)
+            self._icon = 0
 
 
 # Global hotkeys.

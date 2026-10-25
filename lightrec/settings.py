@@ -10,6 +10,7 @@ from . import paths
 
 FPS_CHOICES = (15, 24, 30, 60)
 QUALITY_CHOICES = ("Low", "Medium", "High")
+REPLAY_CHOICES = (15, 30, 60, 120)
 
 
 @dataclass
@@ -38,6 +39,17 @@ class Settings:
     notes_geometry: str = ""
     window_geometry: str = ""
     minibar_position: Optional[list] = None
+    # Gamer mode. View is "record" or "game".
+    view: str = "record"
+    # 1-based display index.
+    game_monitor: int = 1
+    game_fps: int = 30
+    game_quality: str = "Medium"
+    # "auto" or an ffmpeg encoder name such as h264_nvenc.
+    game_encoder: str = "auto"
+    replay_enabled: bool = False
+    replay_seconds: int = 30
+    game_timer: bool = True
 
     @classmethod
     def load(cls) -> "Settings":
@@ -60,6 +72,14 @@ class Settings:
             settings.region = None
         if not settings.output_dir:
             settings.output_dir = paths.default_output_dir()
+        if settings.view not in ("record", "game"):
+            settings.view = "record"
+        if settings.game_fps not in FPS_CHOICES:
+            settings.game_fps = 30
+        if settings.game_quality not in QUALITY_CHOICES:
+            settings.game_quality = "Medium"
+        if settings.replay_seconds not in REPLAY_CHOICES:
+            settings.replay_seconds = 30
         return settings
 
     def save(self) -> None:

@@ -5,6 +5,7 @@ import os
 import queue
 import subprocess
 import sys
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
@@ -12,10 +13,11 @@ from typing import Optional
 from .. import __version__, audio, capture, encoder, paths
 from ..audio import AudioDevice, AudioRecorder
 from ..capture import WindowInfo
+from ..game import GameConfig, GameEngine
 from ..session import RecordingResult, RecordingSession, SessionConfig
-from ..settings import FPS_CHOICES, QUALITY_CHOICES, Settings
+from ..settings import FPS_CHOICES, QUALITY_CHOICES, REPLAY_CHOICES, Settings
 from . import theme
-from .overlays import AboutDialog, Countdown, FfmpegDialog, MiniBar, NotesPanel, RegionSelector
+from .overlays import AboutDialog, Countdown, FfmpegDialog, MiniBar, NotesPanel, RegionSelector, Toast
 from .widgets import Card, Chip, LevelMeter, RoundButton, Tooltip
 
 IS_WINDOWS = sys.platform == "win32"
@@ -24,8 +26,14 @@ IS_MAC = sys.platform == "darwin"
 if IS_WINDOWS:
     from .. import winapi
 
-HOTKEY_RECORD, HOTKEY_PAUSE = 1, 2
+HOTKEY_RECORD, HOTKEY_PAUSE, HOTKEY_CLIP = 1, 2, 3
+TRAY_OPEN, TRAY_CLIP, TRAY_RECORD, TRAY_REPLAY, TRAY_QUIT = 1, 2, 3, 4, 5
 HOTKEY_TEXT = "Ctrl+Shift+R  start / stop      Ctrl+Shift+P  pause"
+GAME_HOTKEY_TEXT = "Ctrl+Shift+R  start / stop      Ctrl+Shift+S  save clip"
+
+
+def replay_label(seconds: int) -> str:
+    return f"{seconds} s" if seconds < 60 else f"{seconds // 60} min"
 
 
 def format_time(seconds: float) -> str:
@@ -68,9 +76,10 @@ def reveal_file(path: str) -> None:
 
 
 class App:
-    def __init__(self) -> None:
+    def __init__(self, start_hidden: bool = False) -> None:
         if IS_WINDOWS:
             winapi.set_dpi_aware()
+        self._start_hidden = start_hidden
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.title("LightRec")
@@ -81,6 +90,14 @@ class App:
         self.events: "queue.Queue[tuple[str, dict]]" = queue.Queue()
         self.session: Optional[RecordingSession] = None
         self.result: Optional[RecordingResult] = None
+        # Gamer mode engine (runs while instant replay is on or a session is being recorded).
+        self.game: Optional[GameEngine] = None
+        self.encoders: Optional[list[str]] = None
+        self._toast: Optional[Toast] = None
+        # Tray icon (Windows), shown while gamer mode runs or the window is tucked away.
+        self.tray = None
+        self._in_tray = False
+        self._tray_state: tuple = ()
         self.monitors_audio: list[AudioRecorder] = []
         self.hidden_windows: list[WindowInfo] = []
         self.windows_cache: list[WindowInfo] = []
@@ -152,12 +169,32 @@ class App:
         ttk.Button(header, text="?", style="Ghost.TButton", width=2, command=self._show_help).pack(side="right")
         self.notes_btn = ttk.Button(header, text="Notes", style="Ghost.TButton", command=self._toggle_notes)
         self.notes_btn.pack(side="right", padx=(0, 4))
+        self.tray_btn = ttk.Button(header, text="Run in background", style="Ghost.TButton", command=self._go_background)
+        Tooltip(self.tray_btn, "Hides the window. Instant replay and the shortcuts keep working; LightRec sits in the "
+                               "tray next to the clock (it may be under the ^ hidden icons).")
         Tooltip(self.notes_btn, "A floating notepad for your script. On Windows it is invisible to the recording."
                 if IS_WINDOWS else "A floating notepad for your script. Keep it outside the recorded area.")
 
+        # Recorder / Gamer switch.
+        switch = tk.Frame(main, bg=theme.PANEL2)
+        switch.grid(row=1, column=0, sticky="ew", pady=(0, int(8 * s)))
+        self.view_var = tk.StringVar(value="record")
+        for i, (value, text) in enumerate((("record", "Recorder"), ("game", "Gamer"))):
+            rb = ttk.Radiobutton(switch, text=text, value=value, variable=self.view_var, style="Seg.Toolbutton",
+                                 command=self._view_changed)
+            rb.pack(side="left", fill="x", expand=True, padx=(0 if i == 0 else 1, 0))
+            self._lockable.append(rb)
+        rec = self.rec_view = tk.Frame(main, bg=theme.BG)
+        rec.grid(row=2, column=0, sticky="ew")
+        rec.columnconfigure(0, weight=1)
+        gv = self.game_view = tk.Frame(main, bg=theme.BG)
+        gv.grid(row=2, column=0, sticky="ew")
+        gv.columnconfigure(0, weight=1)
+        gv.grid_remove()
+
         # Source.
-        card = Card(main, "What to record", s)
-        card.grid(row=1, column=0, sticky="ew", pady=(0, int(6 * s)))
+        card = Card(rec, "What to record", s)
+        card.grid(row=0, column=0, sticky="ew", pady=(0, int(6 * s)))
         seg = tk.Frame(card.body, bg=theme.PANEL2)
         seg.pack(fill="x")
         self.mode_var = tk.StringVar(value="screen")
@@ -201,8 +238,8 @@ class App:
                       style="Muted.TLabel").pack(anchor="w", pady=(6, 0))
 
         # Hidden windows.
-        card = Card(main, "Hide from the recording", s)
-        card.grid(row=2, column=0, sticky="ew", pady=(0, int(6 * s)))
+        card = Card(rec, "Hide from the recording", s)
+        card.grid(row=1, column=0, sticky="ew", pady=(0, int(6 * s)))
         self.hide_box = ttk.Combobox(card.body, state="readonly", postcommand=self._refresh_hide_box)
         self.hide_box.set("Add a window to hide…")
         self.hide_box.pack(fill="x")
@@ -235,8 +272,8 @@ class App:
                 row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         # Options.
-        card = Card(main, "Options", s)
-        card.grid(row=4, column=0, sticky="ew", pady=(0, int(6 * s)))
+        card = Card(rec, "Options", s)
+        card.grid(row=2, column=0, sticky="ew", pady=(0, int(6 * s)))
         row = tk.Frame(card.body, bg=theme.PANEL)
         row.pack(fill="x")
         ttk.Label(row, text="Frame rate", style="Panel.TLabel").pack(side="left")
@@ -265,9 +302,67 @@ class App:
             self._lockable.append(cb)
             Tooltip(cb, HOTKEY_TEXT)
 
+        # Gamer: the display the game is on.
+        card = Card(gv, "Game", s)
+        card.grid(row=0, column=0, sticky="ew", pady=(0, int(6 * s)))
+        row = tk.Frame(card.body, bg=theme.PANEL)
+        row.pack(fill="x")
+        ttk.Label(row, text="Display", style="Panel.TLabel").pack(side="left", padx=(0, 10))
+        self.game_monitor_box = ttk.Combobox(row, state="readonly", width=34)
+        self.game_monitor_box.pack(side="left", fill="x", expand=True)
+        self.game_monitor_box.bind("<<ComboboxSelected>>", lambda e: self._game_settings_changed())
+        self._lockable.append(self.game_monitor_box)
+        ttk.Label(card.body, text="The whole display is recorded, so alt-tabbing to Chrome or Discord never "
+                                  "interrupts it. Black video? Set the game to borderless window mode.",
+                  style="Muted.TLabel", wraplength=int(410 * s), justify="left").pack(anchor="w", pady=(6, 0))
+
+        # Gamer: instant replay.
+        card = Card(gv, "Instant replay", s)
+        card.grid(row=1, column=0, sticky="ew", pady=(0, int(6 * s)))
+        row = tk.Frame(card.body, bg=theme.PANEL)
+        row.pack(fill="x")
+        self.replay_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row, text="Keep the last", variable=self.replay_var, command=self._replay_toggled).pack(side="left")
+        self.replay_box = ttk.Combobox(row, state="readonly", width=6, values=[replay_label(v) for v in REPLAY_CHOICES])
+        self.replay_box.pack(side="left", padx=(2, 8))
+        self.replay_box.bind("<<ComboboxSelected>>", lambda e: self._replay_seconds_changed())
+        ttk.Label(row, text="of gameplay ready to save", style="Panel.TLabel").pack(side="left")
+        self.replay_status = ttk.Label(card.body, text="", style="Muted.TLabel", wraplength=int(410 * s), justify="left")
+        self.replay_status.pack(anchor="w", pady=(6, 0))
+
+        # Gamer: quality.
+        card = Card(gv, "Quality", s)
+        card.grid(row=2, column=0, sticky="ew", pady=(0, int(6 * s)))
+        row = tk.Frame(card.body, bg=theme.PANEL)
+        row.pack(fill="x")
+        ttk.Label(row, text="Frame rate", style="Panel.TLabel").pack(side="left")
+        self.game_fps_box = ttk.Combobox(row, state="readonly", width=5, values=[str(f) for f in FPS_CHOICES])
+        self.game_fps_box.pack(side="left", padx=(8, 14))
+        self.game_fps_box.bind("<<ComboboxSelected>>", lambda e: self._game_settings_changed())
+        ttk.Label(row, text="Quality", style="Panel.TLabel").pack(side="left")
+        self.game_quality_box = ttk.Combobox(row, state="readonly", width=8, values=list(QUALITY_CHOICES))
+        self.game_quality_box.pack(side="left", padx=(8, 0))
+        self.game_quality_box.bind("<<ComboboxSelected>>", lambda e: self._game_settings_changed())
+        # Encoder gets its own row so the window stays the same width as the Recorder view.
+        row = tk.Frame(card.body, bg=theme.PANEL)
+        row.pack(fill="x", pady=(6, 0))
+        ttk.Label(row, text="Encoder", style="Panel.TLabel").pack(side="left")
+        self.encoder_box = ttk.Combobox(row, state="readonly", width=18, values=["Auto"])
+        self.encoder_box.pack(side="left", padx=(8, 0))
+        self.encoder_box.bind("<<ComboboxSelected>>", lambda e: self._game_settings_changed())
+        self._lockable += [self.game_fps_box, self.game_quality_box, self.encoder_box]
+        self.encoder_note = ttk.Label(card.body, text="", style="Muted.TLabel", wraplength=int(410 * s), justify="left")
+        self.encoder_note.pack(anchor="w", pady=(6, 0))
+        self.game_timer_var = tk.BooleanVar(value=True)
+        cb = ttk.Checkbutton(card.body, text="Floating timer while recording", variable=self.game_timer_var,
+                             command=self._sync_settings)
+        cb.pack(anchor="w", pady=(4, 0))
+        Tooltip(cb, "A small timer with a stop button over the game. It is never part of the video.")
+        self._lockable.append(cb)
+
         # Output folder.
         card = Card(main, "Save to", s)
-        card.grid(row=5, column=0, sticky="ew", pady=(0, int(8 * s)))
+        card.grid(row=4, column=0, sticky="ew", pady=(0, int(8 * s)))
         self.out_var = tk.StringVar()
         entry = ttk.Entry(card.body, textvariable=self.out_var, state="readonly")
         entry.pack(side="left", fill="x", expand=True)
@@ -286,8 +381,13 @@ class App:
         self.record_btn = RoundButton(self.record_row, "●  Start recording", self._toggle_record, theme.DANGER,
                                       theme.DANGER_HOVER, theme.DANGER_DOWN, height=int(46 * s),
                                       font=(theme.font_family(self.root), 12, "bold"))
+        # A canvas asks for 378 px by default; keep it small so "Save clip" next to it doesn't widen the window.
+        self.record_btn.configure(width=int(200 * s))
         self.record_btn.pack(side="left", fill="x", expand=True)
         self.pause_btn = ttk.Button(self.record_row, text="Pause", command=self._toggle_pause)
+        self.clip_btn = RoundButton(self.record_row, "Save clip", self._save_clip, theme.ACCENT, theme.ACCENT_HOVER,
+                                    theme.ACCENT_DOWN, height=int(46 * s), font=(theme.font_family(self.root), 11, "bold"))
+        self.clip_btn.configure(width=int(118 * s))
         status_row = tk.Frame(footer, bg=theme.BG)
         status_row.grid(row=1, column=0, sticky="ew", pady=(int(6 * s), 0))
         self.status = ttk.Label(status_row, text="", style="MutedBg.TLabel", wraplength=int(430 * s), justify="left")
@@ -302,7 +402,8 @@ class App:
         self.warn_label = ttk.Label(footer, text="", style="Warn.TLabel", wraplength=int(430 * s), justify="left")
 
         for box in (self.monitor_box, self.window_box, self.hide_box, self.mic_box, self.sys_box, self.fps_box,
-                    self.quality_box):
+                    self.quality_box, self.game_monitor_box, self.replay_box, self.game_fps_box,
+                    self.game_quality_box, self.encoder_box):
             box.bind("<MouseWheel>", self._on_wheel_combobox)
             box.bind("<Button-4>", self._on_wheel_combobox)
             box.bind("<Button-5>", self._on_wheel_combobox)
@@ -310,6 +411,8 @@ class App:
         self.root.bind("<Control-Shift-KeyPress-r>", lambda e: self._toggle_record())
         self.root.bind("<Control-Shift-KeyPress-P>", lambda e: self._toggle_pause())
         self.root.bind("<Control-Shift-KeyPress-p>", lambda e: self._toggle_pause())
+        self.root.bind("<Control-Shift-KeyPress-S>", lambda e: self._save_clip())
+        self.root.bind("<Control-Shift-KeyPress-s>", lambda e: self._save_clip())
         self.root.resizable(False, False)
 
     def _fit_height(self, _e=None) -> None:
@@ -391,6 +494,17 @@ class App:
         self._fill_audio_box(self.mic_box, self.mics, st.mic_key, prefer_default=st.mic_key == "auto")
         self._fill_audio_box(self.sys_box, self.systems, st.system_key, prefer_default=False)
         self._mode_changed(initial=True)
+        labels = [f"Display {m.index}{' (primary)' if m.primary else ''}  ({m.rect[2]}×{m.rect[3]})" for m in self.monitors]
+        self.game_monitor_box.configure(values=labels or ["No display found"])
+        self.game_monitor_box.current(min(max(st.game_monitor - 1, 0), max(len(labels) - 1, 0)))
+        self.game_fps_box.set(str(st.game_fps))
+        self.game_quality_box.set(st.game_quality)
+        self.replay_var.set(st.replay_enabled)
+        self.replay_box.current(REPLAY_CHOICES.index(st.replay_seconds))
+        self.game_timer_var.set(st.game_timer)
+        self._fill_encoder_box()
+        self.view_var.set(st.view)
+        self._view_changed(initial=True)
         self._restart_monitors()
 
     def _fill_audio_box(self, box: ttk.Combobox, devices: list[AudioDevice], key: str, prefer_default: bool) -> None:
@@ -434,6 +548,18 @@ class App:
         st.mic_key = mic.key if mic else ""
         st.system_key = sysdev.key if sysdev else ""
         st.output_dir = self.out_var.get()
+        st.view = self.view_var.get()
+        st.game_monitor = max(1, self.game_monitor_box.current() + 1)
+        try:
+            st.game_fps = int(self.game_fps_box.get())
+        except ValueError:
+            st.game_fps = 30
+        st.game_quality = self.game_quality_box.get() or "Medium"
+        st.game_encoder = self._selected_encoder()
+        st.replay_enabled = bool(self.replay_var.get())
+        idx = self.replay_box.current()
+        st.replay_seconds = REPLAY_CHOICES[idx] if 0 <= idx < len(REPLAY_CHOICES) else 30
+        st.game_timer = bool(self.game_timer_var.get())
         st.save()
 
     def _place_window(self) -> None:
@@ -461,6 +587,10 @@ class App:
         if not self.ffmpeg:
             return "ffmpeg is needed to encode video - LightRec will set it up when you start recording."
         note = getattr(self, "_shortcut_note", "" if IS_WINDOWS else "Ctrl+Shift+R starts / stops while LightRec is focused")
+        if self._in_game_view():
+            if self.game and self.game.replay:
+                return f"Instant replay is on  ·  {note}" if note else "Instant replay is on"
+            return f"Ready  ·  {note}" if note else "Ready"
         return f"Ready  ·  {note}" if note else "Ready"
 
     def _post_init(self) -> None:
@@ -468,6 +598,12 @@ class App:
             self._exclude(self.root)
             self._hotkeys_changed()
         self._set_status(self._idle_text())
+        self._probe_encoders()
+        if self._start_hidden:
+            # Started with --tray: straight to gamer mode, out of the way.
+            self.view_var.set("game")
+            self._view_changed()
+            self.root.after(200, self._go_background)
 
     def _exclude(self, top) -> None:
         if IS_WINDOWS:
@@ -576,10 +712,12 @@ class App:
     def _audio_changed(self) -> None:
         self._sync_settings()
         self._restart_monitors()
+        self._restart_engine()
 
     def _restart_monitors(self) -> None:
         self._stop_monitors()
-        if self.session:
+        # The engine already has the devices open and reports their levels.
+        if self.session or self.game:
             return
         for box, devices, meter in ((self.mic_box, self.mics, self.mic_meter), (self.sys_box, self.systems, self.sys_meter)):
             dev = self._selected_device(box, devices)
@@ -609,18 +747,20 @@ class App:
             self.hotkeys.stop()
             self.hotkeys = None
         if self.hotkeys_var.get():
-            listener = winapi.HotkeyListener(
-                {HOTKEY_RECORD: (winapi.MOD_CONTROL | winapi.MOD_SHIFT, 0x52),
-                 HOTKEY_PAUSE: (winapi.MOD_CONTROL | winapi.MOD_SHIFT, 0x50)},
-                lambda hid: self.events.put(("hotkey", {"id": hid})))
+            bindings = {HOTKEY_RECORD: (winapi.MOD_CONTROL | winapi.MOD_SHIFT, 0x52),
+                        HOTKEY_PAUSE: (winapi.MOD_CONTROL | winapi.MOD_SHIFT, 0x50)}
+            # Ctrl+Shift+S is "Save as" in a lot of apps, so only grab it while a replay buffer exists.
+            if self.game and self.game.replay:
+                bindings[HOTKEY_CLIP] = (winapi.MOD_CONTROL | winapi.MOD_SHIFT, 0x53)
+            listener = winapi.HotkeyListener(bindings, lambda hid: self.events.put(("hotkey", {"id": hid})))
             listener.start()
             listener.wait_ready()
             self.hotkeys = listener
-            self._shortcut_note = ("Shortcuts are in use by another app - use the buttons instead"
-                                   if listener.failed else HOTKEY_TEXT)
+            text = GAME_HOTKEY_TEXT if self._in_game_view() else HOTKEY_TEXT
+            self._shortcut_note = "Shortcuts are in use by another app - use the buttons instead" if listener.failed else text
         else:
             self._shortcut_note = "Global shortcuts are off"
-        if not self.session:
+        if not self.session and not self._game_recording():
             self._set_status(self._idle_text())
 
     def _browse(self) -> None:
@@ -654,6 +794,7 @@ class App:
     def _show_help(self) -> None:
         details = [
             HOTKEY_TEXT if IS_WINDOWS else "Ctrl+Shift+R starts/stops while LightRec is focused.",
+            "Gamer mode: Ctrl+Shift+S saves the last seconds while instant replay is on.",
             f"ffmpeg: {self.ffmpeg or 'not found'}",
             f"Audio backend: {audio.backend_name()}",
             f"Settings: {paths.settings_path()}",
@@ -662,11 +803,419 @@ class App:
         dialog = AboutDialog(self.root, __version__, details, self.scale)
         self._exclude(dialog.top)
 
+    # Gamer mode.
+    def _in_game_view(self) -> bool:
+        return self.view_var.get() == "game"
+
+    def _game_recording(self) -> bool:
+        return bool(self.game and self.game.recording)
+
+    def _view_changed(self, initial: bool = False) -> None:
+        game = self._in_game_view()
+        if game:
+            self.rec_view.grid_remove()
+            self.game_view.grid()
+            self.clip_btn.pack(side="left", padx=(8, 0), fill="y")
+            if IS_WINDOWS:
+                self.tray_btn.pack(side="right", padx=(0, 4), after=self.notes_btn)
+        else:
+            self.game_view.grid_remove()
+            self.rec_view.grid()
+            self.clip_btn.pack_forget()
+            self.tray_btn.pack_forget()
+        self._update_replay_status()
+        if not initial:
+            self._sync_settings()
+            if IS_WINDOWS:
+                self._hotkeys_changed()
+            else:
+                self._set_status(self._idle_text())
+
+    def _game_rect(self):
+        idx = self.game_monitor_box.current()
+        if 0 <= idx < len(self.monitors):
+            return self.monitors[idx].rect
+        return self._primary_rect()
+
+    def _probe_encoders(self) -> None:
+        """
+        Find out in the background which GPU encoders really work here
+        """
+        if not self.ffmpeg:
+            self.encoder_note.configure(text="ffmpeg is set up on the first recording.")
+            return
+        self.encoder_note.configure(text="Checking for a GPU encoder…")
+
+        def work(ffmpeg=self.ffmpeg):
+            names = encoder.probe_encoders(ffmpeg)
+            self.events.put(("encoders", {"names": names}))
+
+        threading.Thread(target=work, name="lightrec-probe", daemon=True).start()
+
+    def _fill_encoder_box(self) -> None:
+        names = self.encoders or []
+        values = ["Auto"] + [encoder.ENCODER_LABELS.get(n, n) for n in names]
+        self.encoder_box.configure(values=values)
+        self.encoder_box.current(0)
+        wanted = self.settings.game_encoder
+        if wanted in names:
+            self.encoder_box.current(names.index(wanted) + 1)
+        if self.encoders is None:
+            return
+        chosen = encoder.pick_encoder(self.ffmpeg or "", wanted) if self.ffmpeg else "libx264"
+        label = encoder.ENCODER_LABELS.get(chosen, chosen)
+        if chosen in dict(encoder.HW_ENCODERS):
+            self.encoder_note.configure(text=f"Encoding on the GPU with {label} - the CPU stays free for the game.")
+        else:
+            self.encoder_note.configure(text="No GPU encoder found, encoding on the CPU. Medium quality at 30 fps "
+                                             "is the safe choice while gaming.")
+
+    def _selected_encoder(self) -> str:
+        # Until the probe is done the box only says "Auto"; don't lose a pinned choice over that.
+        if self.encoders is None:
+            return self.settings.game_encoder
+        idx = self.encoder_box.current() - 1
+        return self.encoders[idx] if 0 <= idx < len(self.encoders) else "auto"
+
+    def _selected_audio(self) -> list[AudioDevice]:
+        return [d for d in (self._selected_device(self.mic_box, self.mics),
+                            self._selected_device(self.sys_box, self.systems)) if d]
+
+    def _need_ffmpeg(self, then) -> bool:
+        """
+        True when ffmpeg is ready; otherwise sets it up and calls `then` afterwards
+        """
+        if self.ffmpeg:
+            return True
+
+        def done(path):
+            if path:
+                self.ffmpeg = path
+                self._set_status(self._idle_text())
+                self._probe_encoders()
+                then()
+
+        FfmpegDialog(self.root, done, self.scale)
+        return False
+
+    def _start_engine(self) -> bool:
+        if self.game:
+            return True
+        self._sync_settings()
+        st = self.settings
+        try:
+            os.makedirs(st.output_dir, exist_ok=True)
+            source = capture.make_screen_source(self._game_rect(), [], bool(self.cursor_var.get()),
+                                                None if IS_WINDOWS else (lambda: self.pointer))
+        except Exception as exc:
+            messagebox.showerror("Can't start gamer mode", str(exc), parent=self.root)
+            return False
+        chosen = encoder.pick_encoder(self.ffmpeg or "", st.game_encoder)
+        cfg = GameConfig(source=source, ffmpeg=self.ffmpeg or "", output_dir=st.output_dir, fps=st.game_fps,
+                         quality=st.game_quality, encoder=chosen, audio=self._selected_audio())
+        engine = GameEngine(cfg, lambda name, data: self.events.put((name, data)))
+        try:
+            engine.start()
+        except Exception as exc:
+            source.close()
+            messagebox.showerror("Can't start gamer mode", str(exc), parent=self.root)
+            return False
+        self._stop_monitors()
+        self.game = engine
+        self.mic_meter.set_enabled(any(not d.is_system for d in cfg.audio))
+        self.sys_meter.set_enabled(any(d.is_system for d in cfg.audio))
+        if engine.warnings:
+            self._set_status("; ".join(engine.warnings), warn=True)
+        return True
+
+    def _stop_engine_if_idle(self) -> None:
+        game = self.game
+        if game and game.replay is None and game.recording is None:
+            self.game = None
+            game.stop()
+            self._restart_monitors()
+            self.dot.itemconfigure(self._dot_item, fill=theme.MUTED)
+            if IS_WINDOWS:
+                self._hotkeys_changed()
+            self._update_replay_status()
+            self.clip_btn.configure_button(enabled=False)
+            self._sync_tray()
+
+    def _restart_engine(self) -> None:
+        """
+        Apply changed settings to a running replay buffer (recordings lock the settings instead)
+        """
+        if not self.game or self._game_recording():
+            return
+        self.game.disarm_replay()
+        self._stop_engine_if_idle()
+        if self.replay_var.get():
+            self._arm_replay()
+
+    def _game_settings_changed(self) -> None:
+        self._sync_settings()
+        self._restart_engine()
+
+    def _replay_toggled(self) -> None:
+        self._sync_settings()
+        if self.replay_var.get():
+            self._arm_replay()
+        else:
+            if self.game:
+                self.game.disarm_replay()
+            self._stop_engine_if_idle()
+            self._set_status(self._idle_text())
+
+    def _replay_seconds_changed(self) -> None:
+        self._sync_settings()
+        if self.game and self.game.replay:
+            self.game.arm_replay(self.settings.replay_seconds)
+
+    def _arm_replay(self) -> None:
+        if not self._need_ffmpeg(self._arm_replay):
+            return
+        if not self._start_engine():
+            self.replay_var.set(False)
+            self._sync_settings()
+            return
+        self.game.arm_replay(self.settings.replay_seconds)
+
+    def _save_clip(self) -> None:
+        if not self.game or not self.game.replay:
+            if self._in_game_view():
+                self._set_status("Turn on instant replay first, then Ctrl+Shift+S saves a clip.", warn=True)
+            return
+        if self.game.replay.buffered < 1.0:
+            self._set_status("Nothing buffered yet - give it a second.", warn=True)
+            return
+        self.game.save_replay()
+        self._set_status("Saving the clip…")
+
+    def _toggle_game_record(self) -> None:
+        if self._game_recording():
+            self.game.stop_recording()
+            return
+        if not self._need_ffmpeg(self._toggle_game_record):
+            return
+        if not self._start_engine():
+            return
+        self.result = None
+        self.result_row.grid_forget()
+        self.warn_label.grid_forget()
+        self.game.start_recording()
+
+    def _update_replay_status(self) -> None:
+        game = self.game
+        if not game or not game.replay:
+            text = "Off" if not self.replay_var.get() else "Starting…"
+            if not self.replay_var.get():
+                text += "  ·  Turn it on before you play; LightRec remembers it."
+            self.replay_status.configure(text=text)
+            return
+        replay = game.replay
+        buffered = min(replay.buffered, replay.seconds)
+        if buffered < replay.seconds - 0.5:
+            text = f"On  ·  buffering {int(buffered)} / {replay.seconds} s"
+        else:
+            text = f"On  ·  {replay_label(replay.seconds)} ready"
+        text += f"  ·  {format_size(replay.bytes)} in memory  ·  Ctrl+Shift+S saves it"
+        self.replay_status.configure(text=text)
+
+    def _show_toast(self, text: str, color: str = theme.OK) -> None:
+        if self._toast:
+            self._toast.destroy()
+        try:
+            self._toast = Toast(self.root, text, self._game_rect(), self._exclude if IS_WINDOWS else None,
+                                self.scale, color=color)
+        except tk.TclError:
+            self._toast = None
+
+    # Background / tray.
+    def _tray_menu(self) -> list:
+        # Runs on the tray thread, so it only reads state.
+        armed = bool(self.game and self.game.replay)
+        recording = self._game_recording()
+        return [
+            (TRAY_CLIP, f"Save the last {replay_label(self.settings.replay_seconds)}\tCtrl+Shift+S", armed, False),
+            (TRAY_RECORD, ("Stop recording" if recording else "Start recording") + "\tCtrl+Shift+R", True, False),
+            (TRAY_REPLAY, "Instant replay", True, armed),
+            None,
+            (TRAY_OPEN, "Open LightRec", True, False),
+            (TRAY_QUIT, "Quit LightRec", True, False),
+        ]
+
+    def _sync_tray(self) -> None:
+        """
+        Keep the tray icon around while gamer mode runs or the window is hidden, colored by state
+        """
+        if not IS_WINDOWS:
+            return
+        if not self.game and not self._in_tray:
+            if self.tray:
+                tray, self.tray = self.tray, None
+                tray.stop()
+            self._tray_state = ()
+            return
+        if self.tray is None:
+            tray = winapi.TrayIcon("LightRec", lambda: self.events.put(("tray", {"id": TRAY_OPEN})),
+                                   lambda mid: self.events.put(("tray", {"id": mid})), self._tray_menu)
+            tray.update(icon=winapi.make_dot_icon(theme.MUTED, theme.PANEL3))
+            tray.start()
+            tray.wait_ready()
+            if not tray.ok:
+                tray.stop()
+                return
+            self.tray = tray
+        if self._game_recording():
+            state = (theme.DANGER, "Recording")
+        elif self.game and self.game.replay:
+            state = (theme.ACCENT, f"Instant replay on  ·  the last {replay_label(self.game.replay.seconds)} are ready")
+        else:
+            state = (theme.MUTED, "Idle")
+        if state != self._tray_state:
+            self._tray_state = state
+            self.tray.update(f"LightRec  ·  {state[1]}", winapi.make_dot_icon(state[0], theme.PANEL3))
+
+    def _go_background(self) -> None:
+        if not IS_WINDOWS:
+            self.root.iconify()
+            return
+        self._in_tray = True
+        self._sync_tray()
+        if self.tray is None:
+            # No tray icon available, minimizing is the next best thing.
+            self._in_tray = False
+            self.root.iconify()
+            return
+        if self.notes and self.notes.visible():
+            self.notes.hide()
+        self.root.withdraw()
+        self._show_toast("LightRec keeps running in the tray, next to the clock", theme.ACCENT)
+
+    def _show_from_tray(self) -> None:
+        self._in_tray = False
+        self._restore_main()
+        try:
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+        self._sync_tray()
+
+    def _tray_event(self, mid: int) -> None:
+        if mid == TRAY_OPEN:
+            self._show_from_tray()
+        elif mid == TRAY_CLIP:
+            self._save_clip()
+        elif mid == TRAY_RECORD:
+            if not self._in_game_view():
+                self.view_var.set("game")
+                self._view_changed()
+            self._toggle_game_record()
+        elif mid == TRAY_REPLAY:
+            self.replay_var.set(not self.replay_var.get())
+            self._replay_toggled()
+        elif mid == TRAY_QUIT:
+            if self._game_recording():
+                self._quit_after_finish = True
+                self.game.stop_recording()
+                self._show_toast("Saving the recording, then quitting…", theme.ACCENT)
+            else:
+                self._quit()
+
+    def _game_event(self, name: str, data: dict) -> None:
+        self._dispatch_game_event(name, data)
+        self._sync_tray()
+
+    def _dispatch_game_event(self, name: str, data: dict) -> None:
+        if name == "encoders":
+            self.encoders = data.get("names", [])
+            self._fill_encoder_box()
+            # Instant replay was on last time, bring it back.
+            if self.settings.replay_enabled and self.replay_var.get() and not self.game and self.ffmpeg:
+                self._arm_replay()
+        elif name == "replay_armed":
+            self.dot.itemconfigure(self._dot_item, fill=theme.ACCENT if not self._game_recording() else theme.DANGER)
+            self.clip_btn.configure_button(enabled=True)
+            if IS_WINDOWS:
+                self._hotkeys_changed()
+            else:
+                self._set_status(self._idle_text())
+            self._update_replay_status()
+            self._show_toast(f"Instant replay on  ·  Ctrl+Shift+S saves the last {replay_label(data.get('seconds', 30))}",
+                             theme.ACCENT)
+        elif name == "replay_off":
+            self._update_replay_status()
+        elif name == "replay_error":
+            self.replay_var.set(False)
+            self._sync_settings()
+            self._stop_engine_if_idle()
+            self._set_status(f"Instant replay stopped: {data.get('message', '')}", warn=True)
+        elif name == "clip_saved":
+            result: RecordingResult = data["result"]
+            self.result = result
+            prefix = "Recording…  ·  " if self._game_recording() else ""
+            self._set_status(f"{prefix}Saved clip {os.path.basename(result.path)}  ·  {format_size(result.size)}  ·  "
+                             f"{format_time(result.duration)}")
+            self.result_row.grid(row=2, column=0, sticky="w", pady=(2, 0))
+            self._show_toast(f"Clip saved  ·  {format_time(result.duration)}")
+        elif name == "clip_error":
+            self._set_status(f"Clip not saved: {data.get('message', '')}", warn=True)
+            self._show_toast("Clip not saved", theme.DANGER)
+        elif name == "rec_started":
+            self._set_recording_ui(True, pause=False)
+            if self.game_timer_var.get():
+                pos = tuple(self.settings.minibar_position) if self.settings.minibar_position else None
+                self.minibar = MiniBar(self.root, self._toggle_pause, self._toggle_record, pos, capture.virtual_screen(),
+                                       self._minibar_moved, self._exclude if IS_WINDOWS else None, self.scale,
+                                       show_pause=False)
+            self._set_status("Recording…")
+            self._show_toast("Recording", theme.DANGER)
+        elif name == "rec_finalizing":
+            if self.minibar:
+                self.minibar.set_saving()
+            self.record_btn.configure_button(text="Saving…", enabled=False)
+            self._set_status("Saving the recording…")
+        elif name in ("rec_finished", "rec_error"):
+            if self.minibar:
+                self.minibar.destroy()
+                self.minibar = None
+            self._set_recording_ui(False)
+            self._stop_engine_if_idle()
+            self.dot.itemconfigure(self._dot_item, fill=theme.ACCENT if self.game and self.game.replay else theme.MUTED)
+            if name == "rec_finished":
+                result = data["result"]
+                self.result = result
+                self._set_status(f"Saved {os.path.basename(result.path)}  ·  {format_size(result.size)}  ·  "
+                                 f"{format_time(result.duration)}")
+                self.result_row.grid(row=2, column=0, sticky="w", pady=(2, 0))
+                if result.warnings:
+                    self.warn_label.configure(text="Note: " + "  ".join(result.warnings))
+                    self.warn_label.grid(row=3, column=0, sticky="w", pady=(4, 0))
+                self._show_toast(f"Recording saved  ·  {format_time(result.duration)}")
+            else:
+                self._set_status("Recording failed", warn=True)
+                messagebox.showerror("Recording failed", data.get("message", "Unknown error"), parent=self.root)
+            if self._quit_after_finish:
+                self.root.after(100, self._quit)
+        elif name == "engine_error":
+            game, self.game = self.game, None
+            if game:
+                game.stop()
+            self.replay_var.set(False)
+            self._sync_settings()
+            self._set_recording_ui(False)
+            self._restart_monitors()
+            self._set_status("Gamer mode stopped", warn=True)
+            messagebox.showerror("Gamer mode stopped", data.get("message", "Unknown error"), parent=self.root)
+
     # Recording.
     def _toggle_record(self) -> None:
         if self.session:
             if self.session.state in ("recording", "paused"):
                 self.session.stop()
+            return
+        if self._in_game_view() or self._game_recording():
+            self._toggle_game_record()
             return
         if self._countdown:
             return
@@ -780,7 +1329,7 @@ class App:
         self.settings.minibar_position = [x, y]
         self.settings.save()
 
-    def _set_recording_ui(self, recording: bool) -> None:
+    def _set_recording_ui(self, recording: bool, pause: bool = True) -> None:
         for widget in self._lockable:
             try:
                 widget.state(["disabled"] if recording else ["!disabled"])
@@ -792,7 +1341,8 @@ class App:
         if recording:
             self.record_btn.configure_button(text="■  Stop recording", colors=(theme.PANEL3, theme.PANEL4, theme.PANEL2))
             self.pause_btn.configure(text="Pause")
-            self.pause_btn.pack(side="left", padx=(8, 0), fill="y")
+            if pause:
+                self.pause_btn.pack(side="left", padx=(8, 0), fill="y")
             self.dot.itemconfigure(self._dot_item, fill=theme.DANGER)
         else:
             self.record_btn.configure_button(text="●  Start recording",
@@ -813,6 +1363,14 @@ class App:
                 self._toggle_record()
             elif data.get("id") == HOTKEY_PAUSE:
                 self._toggle_pause()
+            elif data.get("id") == HOTKEY_CLIP:
+                self._save_clip()
+            return
+        if name == "tray":
+            self._tray_event(int(data.get("id", 0)))
+            return
+        if name.startswith(("replay_", "clip_", "rec_", "engine_")) or name == "encoders":
+            self._game_event(name, data)
             return
         if name == "paused":
             if self.minibar:
@@ -886,6 +1444,23 @@ class App:
                     self.pointer = self.root.winfo_pointerxy()
                 except tk.TclError:
                     pass
+        elif self.game:
+            levels = self.game.levels()
+            mic = self._selected_device(self.mic_box, self.mics)
+            sysdev = self._selected_device(self.sys_box, self.systems)
+            self.mic_meter.set(levels.get(mic.key, 0.0) if mic else 0.0)
+            self.sys_meter.set(levels.get(sysdev.key, 0.0) if sysdev else 0.0)
+            if self.minibar and self.game.recording:
+                self.minibar.set_time(format_time(self.game.elapsed))
+                if self._tick_count % 5 == 0:
+                    self.minibar.blink(False)
+            if self._tick_count % 10 == 0:
+                self._update_replay_status()
+            if not IS_WINDOWS:
+                try:
+                    self.pointer = self.root.winfo_pointerxy()
+                except tk.TclError:
+                    pass
         else:
             mic = self._selected_device(self.mic_box, self.mics)
             sysdev = self._selected_device(self.sys_box, self.systems)
@@ -898,6 +1473,19 @@ class App:
 
     # Exit.
     def on_close(self) -> None:
+        if IS_WINDOWS and self.game and (self.game.replay or self.game.recording):
+            # Gamer mode is busy, so the X only tucks LightRec away; Quit lives in the tray menu.
+            self._go_background()
+            return
+        if self._game_recording():
+            if self.game.recording.stopping:
+                self._quit_after_finish = True
+                return
+            if messagebox.askyesno("Recording in progress", "Stop and save the recording before quitting?",
+                                   parent=self.root):
+                self._quit_after_finish = True
+                self.game.stop_recording()
+            return
         if self.session and self.session.state in ("recording", "paused", "finalizing"):
             if self.session.state == "finalizing":
                 self._quit_after_finish = True
@@ -916,6 +1504,12 @@ class App:
         except tk.TclError:
             pass
         self._stop_monitors()
+        if self.game:
+            game, self.game = self.game, None
+            game.stop()
+        if self.tray:
+            tray, self.tray = self.tray, None
+            tray.stop()
         if self.hotkeys:
             self.hotkeys.stop()
         if self.notes:
@@ -930,4 +1524,4 @@ class App:
 
 
 def main() -> None:
-    App().run()
+    App(start_hidden="--tray" in sys.argv[1:]).run()

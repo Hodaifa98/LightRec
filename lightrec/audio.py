@@ -11,7 +11,7 @@ import time
 import wave
 from array import array
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 IS_WINDOWS = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
@@ -191,9 +191,12 @@ class AudioRecorder:
     Record one device to a WAV file (or only monitor its level when path is None)
     """
 
-    def __init__(self, device: AudioDevice, path: Optional[str] = None):
+    def __init__(self, device: AudioDevice, path: Optional[str] = None,
+                 on_chunk: Optional[Callable[[bytes, float], None]] = None):
         self.device = device
         self.path = path
+        # Gets every chunk plus the time it arrived (gamer mode feeds its ring buffer with this).
+        self.on_chunk = on_chunk
         self.level = 0.0
         self.error: Optional[str] = None
         self._queue: "queue.Queue[bytes]" = queue.Queue()
@@ -273,6 +276,16 @@ class AudioRecorder:
         self.level = max(peak, self.level * 0.75)
         if self._running and self.path and not self._paused:
             self._queue.put(data)
+        if self._running and self.on_chunk is not None:
+            self.on_chunk(data, time.perf_counter())
+
+    @property
+    def channels(self) -> int:
+        return self._channels
+
+    @property
+    def rate(self) -> int:
+        return self._rate
 
     def pause(self) -> None:
         with self._lock:

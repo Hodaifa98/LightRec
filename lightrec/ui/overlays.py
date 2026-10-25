@@ -209,7 +209,7 @@ class MiniBar:
 
     def __init__(self, root: tk.Misc, on_pause: Callable[[], None], on_stop: Callable[[], None],
                  position: Optional[tuple[int, int]], screen: Rect, on_moved: Callable[[int, int], None],
-                 exclude: ExcludeFn = None, scale: float = 1.0):
+                 exclude: ExcludeFn = None, scale: float = 1.0, show_pause: bool = True):
         self.on_moved = on_moved
         top = self.top = tk.Toplevel(root)
         top.overrideredirect(True)
@@ -224,7 +224,9 @@ class MiniBar:
                              font=(theme.font_family(top), 11, "bold"))
         self.time.pack(side="left", padx=(2, 8))
         self.pause_btn = IconButton(frame, "pause", on_pause, theme.TEXT, size=int(26 * scale))
-        self.pause_btn.pack(side="left", padx=2)
+        # Gamer mode has no pause, it just records.
+        if show_pause:
+            self.pause_btn.pack(side="left", padx=2)
         self.stop_btn = IconButton(frame, "stop", on_stop, theme.DANGER, size=int(26 * scale))
         self.stop_btn.pack(side="left", padx=2)
         self.status = tk.Label(frame, text="", bg=theme.PANEL, fg=theme.MUTED, font=(theme.font_family(top), 9))
@@ -277,6 +279,43 @@ class MiniBar:
         self.status.pack(side="left", padx=(0, 4))
         self.dot._color = theme.ACCENT
         self.dot._draw()
+
+    def destroy(self) -> None:
+        try:
+            self.top.destroy()
+        except tk.TclError:
+            pass
+
+
+class Toast:
+    """
+    Small notice in the corner of the game display that fades away on its own
+    """
+
+    def __init__(self, root: tk.Misc, text: str, screen: Rect, exclude: ExcludeFn = None, scale: float = 1.0,
+                 duration_ms: int = 2600, color: str = theme.OK):
+        top = self.top = tk.Toplevel(root)
+        top.overrideredirect(True)
+        top.attributes("-topmost", True)
+        frame = tk.Frame(top, bg=theme.PANEL, highlightbackground=theme.BORDER, highlightthickness=1,
+                         padx=int(14 * scale), pady=int(9 * scale))
+        frame.pack()
+        dot = tk.Canvas(frame, width=12, height=12, bg=theme.PANEL, highlightthickness=0)
+        dot.create_oval(1, 1, 11, 11, fill=color, outline="")
+        dot.pack(side="left", padx=(0, 9))
+        tk.Label(frame, text=text, bg=theme.PANEL, fg=theme.TEXT, font=(theme.font_family(top), 10, "bold")).pack(side="left")
+        top.update_idletasks()
+        w = top.winfo_reqwidth()
+        margin = int(18 * scale)
+        top.geometry(f"+{screen[0] + screen[2] - w - margin}+{screen[1] + margin}")
+        _exclude(top, exclude)
+        if IS_WINDOWS:
+            try:
+                from .. import winapi
+                winapi.make_passive(winapi.tk_hwnd(top))
+            except Exception:
+                pass
+        top.after(duration_ms, self.destroy)
 
     def destroy(self) -> None:
         try:

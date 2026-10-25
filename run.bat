@@ -13,5 +13,5 @@ if not exist ".venv\Scripts\python.exe" (
     ".venv\Scripts\python.exe" -m pip install --quiet --upgrade pip
     ".venv\Scripts\python.exe" -m pip install --quiet -r requirements.txt
 )
-start "" ".venv\Scripts\pythonw.exe" LightRec.py
+start "" ".venv\Scripts\pythonw.exe" LightRec.py %*
 endlocal

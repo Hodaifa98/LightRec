@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import urllib.request
 import zipfile
 from typing import Callable, Optional
@@ -23,6 +24,15 @@ QUALITY_PRESETS = {
     "Medium": ("veryfast", 23),
     "High": ("faster", 18),
 }
+# GPU encoders in the order we prefer them, with the name shown in the UI.
+HW_ENCODERS = (
+    ("h264_nvenc", "NVIDIA NVENC"),
+    ("h264_amf", "AMD AMF"),
+    ("h264_qsv", "Intel Quick Sync"),
+)
+ENCODER_LABELS = {"libx264": "CPU (x264)", **dict(HW_ENCODERS)}
+# Constant-quality values for the GPU encoders (lower is better, like crf).
+HW_QUALITY = {"Low": 28, "Medium": 23, "High": 19}
 
 
 class EncodeError(RuntimeError):
@@ -83,6 +93,84 @@ def has_encoder(ffmpeg: str, name: str) -> bool:
         except (OSError, subprocess.SubprocessError):
             _encoder_cache[key] = False
     return _encoder_cache[key]
+
+
+_probe_cache: dict[str, list[str]] = {}
+_probe_lock = threading.Lock()
+
+
+def _test_encode(ffmpeg: str, name: str) -> bool:
+    """
+    Encode three tiny black frames, because a listed GPU encoder still fails without the GPU
+    """
+    args = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-f", "rawvideo", "-pix_fmt", "bgra",
+            "-video_size", "256x256", "-framerate", "30", "-i", "pipe:0", "-frames:v", "3", "-c:v", name,
+            "-pix_fmt", "yuv420p", "-f", "null", "-"]
+    try:
+        proc = subprocess.run(args, input=bytes(256 * 256 * 4 * 3), capture_output=True, timeout=20, **_popen_kwargs())
+        return proc.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def probe_encoders(ffmpeg: str) -> list[str]:
+    """
+    Encoders that actually work on this machine, GPU ones first (takes a second or two, cached)
+    """
+    with _probe_lock:
+        if ffmpeg not in _probe_cache:
+            working = [name for name, _label in HW_ENCODERS if has_encoder(ffmpeg, name) and _test_encode(ffmpeg, name)]
+            if has_encoder(ffmpeg, "libx264"):
+                working.append("libx264")
+            _probe_cache[ffmpeg] = working
+        return list(_probe_cache[ffmpeg])
+
+
+def pick_encoder(ffmpeg: str, wanted: str = "auto") -> str:
+    """
+    Resolve "auto" (or an encoder that isn't available anymore) to something that works
+    """
+    working = probe_encoders(ffmpeg)
+    if wanted != "auto" and wanted in working:
+        return wanted
+    return working[0] if working else "mpeg4"
+
+
+def codec_args(encoder: str, quality: str, fps: int, low_latency: bool = False) -> list[str]:
+    """
+    Codec part of the ffmpeg command line for one encoder
+    """
+    # Keyframe every second for the replay buffer (clips are cut there), every two seconds otherwise.
+    gop = fps if low_latency else fps * 2
+    if encoder == "libx264":
+        preset, crf = QUALITY_PRESETS.get(quality, QUALITY_PRESETS["Medium"])
+        args = ["-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-g", str(gop), "-keyint_min", str(gop),
+                "-sc_threshold", "0", "-pix_fmt", "yuv420p"]
+        if low_latency:
+            args += ["-tune", "zerolatency"]
+        return args
+    q = HW_QUALITY.get(quality, 23)
+    if encoder == "h264_nvenc":
+        args = ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", str(q), "-b:v", "0",
+                "-g", str(gop), "-forced-idr", "1", "-pix_fmt", "yuv420p"]
+        if low_latency:
+            args += ["-tune", "ll", "-delay", "0", "-rc-lookahead", "0", "-bf", "0"]
+        return args
+    if encoder == "h264_amf":
+        args = ["-c:v", "h264_amf", "-quality", "balanced", "-rc", "cqp", "-qp_i", str(q), "-qp_p", str(q),
+                "-g", str(gop), "-pix_fmt", "yuv420p"]
+        if low_latency:
+            args += ["-usage", "lowlatency", "-bf", "0"]
+        return args
+    if encoder == "h264_qsv":
+        args = ["-c:v", "h264_qsv", "-preset", "medium", "-global_quality", str(q), "-g", str(gop),
+                "-pix_fmt", "nv12"]
+        if low_latency:
+            args += ["-look_ahead", "0", "-bf", "0", "-async_depth", "1"]
+        return args
+    # Builds without x264 fall back to MPEG-4.
+    return ["-c:v", "mpeg4", "-q:v", {"Low": "8", "Medium": "5", "High": "3"}.get(quality, "5"),
+            "-g", str(gop), "-pix_fmt", "yuv420p"]
 
 
 def version_string(ffmpeg: str) -> str:
@@ -186,30 +274,38 @@ def _tail(log_path: Optional[str], lines: int = 6) -> str:
 
 class VideoWriter:
     """
-    Pipe raw BGRA frames into ffmpeg to produce an H.264 MP4
+    Pipe raw BGRA frames into ffmpeg to produce an H.264 MP4 (a file, or a fragmented stream on stdout)
     """
 
-    def __init__(self, ffmpeg: str, path: str, width: int, height: int, fps: int, quality: str, log_path: str):
-        preset, crf = QUALITY_PRESETS.get(quality, QUALITY_PRESETS["Medium"])
-        if has_encoder(ffmpeg, "libx264"):
-            codec = ["-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p"]
-        # Builds without x264 fall back to MPEG-4.
+    def __init__(self, ffmpeg: str, path: str, width: int, height: int, fps: int, quality: str, log_path: str,
+                 encoder: Optional[str] = None, fragmented: bool = False, stream: bool = False,
+                 low_latency: bool = False):
+        if encoder is None:
+            encoder = "libx264" if has_encoder(ffmpeg, "libx264") else "mpeg4"
+        codec = codec_args(encoder, quality, fps, low_latency)
+        if fragmented or stream:
+            # Every fragment is playable on its own, so a crash (or a cut) never loses the whole file.
+            container = ["-f", "mp4", "-movflags", "+frag_keyframe+empty_moov+default_base_moof"]
         else:
-            codec = ["-c:v", "mpeg4", "-q:v", {"Low": "8", "Medium": "5", "High": "3"}.get(quality, "5"),
-                     "-pix_fmt", "yuv420p"]
+            container = ["-movflags", "+faststart"]
+        target = "pipe:1" if stream else path
         args = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
                 "-f", "rawvideo", "-pix_fmt", "bgra", "-video_size", f"{width}x{height}",
-                "-framerate", str(fps), "-i", "pipe:0", "-an", *codec, "-movflags", "+faststart", path]
+                "-framerate", str(fps), "-i", "pipe:0", "-an", *codec, *container, target]
         self.path = path
+        self.encoder = encoder
         self.log_path = log_path
         self.frames = 0
         self._log = open(log_path, "w", encoding="utf-8")
         try:
-            self._proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            self._proc = subprocess.Popen(args, stdin=subprocess.PIPE,
+                                          stdout=subprocess.PIPE if stream else subprocess.DEVNULL,
                                           stderr=self._log, bufsize=0, **_popen_kwargs())
         except OSError as exc:
             self._log.close()
             raise EncodeError(f"Could not start ffmpeg: {exc}") from exc
+        # Only set when streaming; the replay buffer reads the fragments from here.
+        self.stdout = self._proc.stdout if stream else None
 
     def write(self, frame: bytes) -> None:
         try:
@@ -242,6 +338,22 @@ class VideoWriter:
             self._log.close()
         except OSError:
             pass
+
+
+def remux(ffmpeg: str, video: str, output: str, log_path: str) -> None:
+    """
+    Rewrite a (fragmented) video as a normal fast-start MP4 without re-encoding
+    """
+    args = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", video, "-c", "copy",
+            "-movflags", "+faststart", output]
+    with open(log_path, "w", encoding="utf-8") as log:
+        try:
+            code = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=log, timeout=3600,
+                                  **_popen_kwargs()).returncode
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise EncodeError(f"Could not run ffmpeg: {exc}") from exc
+    if code != 0 or not os.path.isfile(output) or os.path.getsize(output) == 0:
+        raise EncodeError(f"Finishing the video failed.\n{_tail(log_path)}")
 
 
 def mux(ffmpeg: str, video: str, audio: list[str], output: str, log_path: str) -> None:
