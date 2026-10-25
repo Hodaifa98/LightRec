@@ -1,0 +1,9 @@
+# All platforms.
+mss>=9.0            # Screen capture on Linux and macOS.
+sounddevice>=0.4.6  # Microphone capture.
+
+# Windows only, system audio (WASAPI loopback).
+pyaudiowpatch>=0.2.12; sys_platform == "win32"
+
+# Optional, bundles an ffmpeg binary.
+# imageio-ffmpeg>=0.5
