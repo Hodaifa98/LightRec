@@ -11,16 +11,16 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Hodaifa98/light_rec.py/releases/latest"><img src="https://img.shields.io/github/v/release/Hodaifa98/light_rec.py?label=latest&color=ff4d5e" alt="Latest release"></a>
+  <a href="https://github.com/Hodaifa98/LightRec/releases/latest"><img src="https://img.shields.io/github/v/release/Hodaifa98/LightRec?label=latest&color=ff4d5e" alt="Latest release"></a>
   <img src="https://img.shields.io/badge/Windows-10%2F11-4f8cff" alt="Windows 10 / 11">
   <img src="https://img.shields.io/badge/Linux-X11-4f8cff" alt="Linux (X11)">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-36d274" alt="MIT license"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/Hodaifa98/light_rec.py/releases/latest/download/LightRec-windows-x64.zip"><b>⬇ Download for Windows</b></a>
+  <a href="https://github.com/Hodaifa98/LightRec/releases/latest/download/LightRec-windows-x64.zip"><b>⬇ Download for Windows</b></a>
   &nbsp;&nbsp;·&nbsp;&nbsp;
-  <a href="https://github.com/Hodaifa98/light_rec.py/releases/latest/download/LightRec-linux-x64.tar.gz"><b>⬇ Download for Linux</b></a>
+  <a href="https://github.com/Hodaifa98/LightRec/releases/latest/download/LightRec-linux-x64.tar.gz"><b>⬇ Download for Linux</b></a>
   &nbsp;&nbsp;·&nbsp;&nbsp;
   <a href="https://hodaifa98.github.io/HApps/lightrec/">Website</a>
 </p>
@@ -98,12 +98,12 @@ the middle of a match changes nothing**.
 
 ## Download and run
 
-**Windows 10 / 11.** [Download the zip](https://github.com/Hodaifa98/light_rec.py/releases/latest/download/LightRec-windows-x64.zip),
+**Windows 10 / 11.** [Download the zip](https://github.com/Hodaifa98/LightRec/releases/latest/download/LightRec-windows-x64.zip),
 unzip it anywhere (a USB stick works) and double-click `LightRec.exe`. ffmpeg is in the folder,
 there is nothing to install. The exe isn't code-signed, so SmartScreen may ask once: *More info*,
 then *Run anyway*.
 
-**Linux (X11).** [Download the tar.gz](https://github.com/Hodaifa98/light_rec.py/releases/latest/download/LightRec-linux-x64.tar.gz),
+**Linux (X11).** [Download the tar.gz](https://github.com/Hodaifa98/LightRec/releases/latest/download/LightRec-linux-x64.tar.gz),
 extract it and run `./LightRec`. System audio uses PulseAudio / PipeWire monitor sources, window
 recording needs `wmctrl`. Wayland sessions are not supported for capture.
 
