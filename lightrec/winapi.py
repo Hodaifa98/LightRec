@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import itertools
 import os
 import sys
 import threading
@@ -45,6 +46,9 @@ MONITORINFOF_PRIMARY = 1
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
 MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_NOREPEAT = 0x0001, 0x0002, 0x0004, 0x4000
+HWND_TOPMOST = -1
+SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE, SWP_NOOWNERZORDER = 0x0001, 0x0002, 0x0010, 0x0200
+QUNS_RUNNING_D3D_FULL_SCREEN = 3
 
 
 # Structures.
@@ -116,6 +120,9 @@ def _setup_prototypes() -> None:
     u.DrawIconEx.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int, wt.HICON, ctypes.c_int, ctypes.c_int,
                              wt.UINT, wt.HBRUSH, wt.UINT]
     u.SetWindowDisplayAffinity.restype, u.SetWindowDisplayAffinity.argtypes = wt.BOOL, [wt.HWND, wt.DWORD]
+    u.SetWindowPos.restype = wt.BOOL
+    u.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wt.UINT]
+    u.GetForegroundWindow.restype = wt.HWND
     u.EnumWindows.argtypes = [WNDENUMPROC, wt.LPARAM]
     u.EnumDisplayMonitors.argtypes = [wt.HDC, ctypes.POINTER(wt.RECT), MONITORENUMPROC, wt.LPARAM]
     u.GetMonitorInfoW.argtypes = [wt.HMONITOR, ctypes.POINTER(MONITORINFOEXW)]
@@ -183,6 +190,38 @@ def make_passive(hwnd: int) -> None:
                               style | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW)
     except OSError:
         pass
+
+
+def keep_on_top(hwnd: int) -> None:
+    """
+    Put a topmost popup back above other topmost windows (borderless games) without activating it
+    """
+    try:
+        user32.SetWindowPos(wt.HWND(hwnd), wt.HWND(HWND_TOPMOST), 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER)
+    except OSError:
+        pass
+
+
+def exclusive_fullscreen() -> bool:
+    """
+    True while a game runs in exclusive fullscreen
+    """
+    # Other windows can't be drawn over such a game, and popping one up can knock it out of fullscreen.
+    state = ctypes.c_int(0)
+    try:
+        hr = ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(state))
+    except (AttributeError, OSError):
+        return False
+    return hr == 0 and state.value == QUNS_RUNNING_D3D_FULL_SCREEN
+
+
+def foreground_is_ours() -> bool:
+    """
+    True when the window the user is in belongs to LightRec
+    """
+    hwnd = user32.GetForegroundWindow()
+    return bool(hwnd) and window_pid(int(hwnd)) == _OWN_PID
 
 
 # Rect is (x, y, w, h).
@@ -704,6 +743,7 @@ def _setup_tray_prototypes() -> None:
     u.DefWindowProcW.restype = ctypes.c_ssize_t
     u.DefWindowProcW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
     u.RegisterClassW.restype, u.RegisterClassW.argtypes = wt.ATOM, [ctypes.POINTER(WNDCLASSW)]
+    u.UnregisterClassW.restype, u.UnregisterClassW.argtypes = wt.BOOL, [wt.LPCWSTR, wt.HINSTANCE]
     u.CreateWindowExW.restype = wt.HWND
     u.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD, ctypes.c_int, ctypes.c_int,
                                   ctypes.c_int, ctypes.c_int, wt.HWND, wt.HMENU, wt.HINSTANCE, wt.LPVOID]
@@ -769,9 +809,14 @@ class TrayIcon(threading.Thread):
     Icon next to the clock with a right-click menu, run on its own message loop thread
     """
 
+    _ids = itertools.count(1)
+
     def __init__(self, tooltip: str, on_click: Callable[[], None], on_menu: Callable[[int], None],
                  menu: Callable[[], list[MenuItem]]):
         super().__init__(name="lightrec-tray", daemon=True)
+        # A window class keeps the procedure it was first registered with, so a shared name would send
+        # this icon's clicks to an earlier, stopped icon (and its right-click menu would never open).
+        self._class = f"LightRecTray{next(self._ids)}"
         self._tooltip = tooltip
         self._on_click, self._on_menu, self._menu = on_click, on_menu, menu
         self._hwnd = 0
@@ -789,11 +834,12 @@ class TrayIcon(threading.Thread):
         cls = WNDCLASSW()
         cls.lpfnWndProc = self._proc
         cls.hInstance = inst
-        cls.lpszClassName = "LightRecTray"
+        cls.lpszClassName = self._class
         user32.RegisterClassW(ctypes.byref(cls))
         self._taskbar_created = user32.RegisterWindowMessageW("TaskbarCreated")
-        self._hwnd = user32.CreateWindowExW(0, "LightRecTray", "LightRec", 0, 0, 0, 0, 0, None, None, inst, None)
+        self._hwnd = user32.CreateWindowExW(0, self._class, "LightRec", 0, 0, 0, 0, 0, None, None, inst, None)
         if not self._hwnd:
+            user32.UnregisterClassW(self._class, inst)
             self._ready.set()
             return
         self.ok = bool(self._notify(NIM_ADD))
@@ -802,6 +848,7 @@ class TrayIcon(threading.Thread):
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
+        user32.UnregisterClassW(self._class, inst)
 
     def _data(self, flags: int) -> NOTIFYICONDATAW:
         data = NOTIFYICONDATAW()

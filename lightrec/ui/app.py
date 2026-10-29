@@ -16,7 +16,7 @@ from ..capture import WindowInfo
 from ..game import GameConfig, GameEngine
 from ..session import RecordingResult, RecordingSession, SessionConfig
 from ..settings import FPS_CHOICES, QUALITY_CHOICES, REPLAY_CHOICES, Settings
-from . import theme
+from . import cues, theme
 from .overlays import AboutDialog, Countdown, FfmpegDialog, MiniBar, NotesPanel, RegionSelector, Toast
 from .widgets import Card, Chip, LevelMeter, RoundButton, Tooltip
 
@@ -359,6 +359,13 @@ class App:
         cb.pack(anchor="w", pady=(4, 0))
         Tooltip(cb, "A small timer with a stop button over the game. It is never part of the video.")
         self._lockable.append(cb)
+        if IS_WINDOWS:
+            self.fullscreen_sound_var = tk.BooleanVar(value=True)
+            cb = ttk.Checkbutton(card.body, text="Beep in exclusive fullscreen games", variable=self.fullscreen_sound_var,
+                                 command=self._sync_settings)
+            cb.pack(anchor="w", pady=(2, 0))
+            Tooltip(cb, "Nothing can be shown over a game in exclusive fullscreen, so a quiet beep confirms the "
+                        "shortcuts instead. With system sound on, the recording can pick it up.")
 
         # Output folder.
         card = Card(main, "Save to", s)
@@ -502,6 +509,8 @@ class App:
         self.replay_var.set(st.replay_enabled)
         self.replay_box.current(REPLAY_CHOICES.index(st.replay_seconds))
         self.game_timer_var.set(st.game_timer)
+        if IS_WINDOWS:
+            self.fullscreen_sound_var.set(st.fullscreen_sound)
         self._fill_encoder_box()
         self.view_var.set(st.view)
         self._view_changed(initial=True)
@@ -560,6 +569,8 @@ class App:
         idx = self.replay_box.current()
         st.replay_seconds = REPLAY_CHOICES[idx] if 0 <= idx < len(REPLAY_CHOICES) else 30
         st.game_timer = bool(self.game_timer_var.get())
+        if IS_WINDOWS:
+            st.fullscreen_sound = bool(self.fullscreen_sound_var.get())
         st.save()
 
     def _place_window(self) -> None:
@@ -1019,9 +1030,24 @@ class App:
         text += f"  ·  {format_size(replay.bytes)} in memory  ·  Ctrl+Shift+S saves it"
         self.replay_status.configure(text=text)
 
-    def _show_toast(self, text: str, color: str = theme.OK) -> None:
+    @staticmethod
+    def _fullscreen_game() -> bool:
+        return IS_WINDOWS and winapi.exclusive_fullscreen()
+
+    def _cue(self, kind: str) -> None:
+        if self.settings.fullscreen_sound:
+            cues.play(kind)
+
+    def _show_toast(self, text: str, color: str = theme.OK, cue: Optional[str] = None) -> None:
         if self._toast:
             self._toast.destroy()
+            self._toast = None
+        if self._fullscreen_game():
+            # A popup can't be seen over an exclusive fullscreen game and can knock it out of fullscreen,
+            # so a short sound stands in for it.
+            if cue:
+                self._cue(cue)
+            return
         try:
             self._toast = Toast(self.root, text, self._game_rect(), self._exclude if IS_WINDOWS else None,
                                 self.scale, color=color)
@@ -1030,9 +1056,10 @@ class App:
 
     # Background / tray.
     def _tray_menu(self) -> list:
-        # Runs on the tray thread, so it only reads state.
-        armed = bool(self.game and self.game.replay)
-        recording = self._game_recording()
+        # Runs on the tray thread, so it only reads state, and reads the engine once since it can go away meanwhile.
+        game = self.game
+        armed = bool(game and game.replay)
+        recording = bool(game and game.recording)
         return [
             (TRAY_CLIP, f"Save the last {replay_label(self.settings.replay_seconds)}\tCtrl+Shift+S", armed, False),
             (TRAY_RECORD, ("Stop recording" if recording else "Start recording") + "\tCtrl+Shift+R", True, False),
@@ -1155,19 +1182,19 @@ class App:
             self._set_status(f"{prefix}Saved clip {os.path.basename(result.path)}  ·  {format_size(result.size)}  ·  "
                              f"{format_time(result.duration)}")
             self.result_row.grid(row=2, column=0, sticky="w", pady=(2, 0))
-            self._show_toast(f"Clip saved  ·  {format_time(result.duration)}")
+            self._show_toast(f"Clip saved  ·  {format_time(result.duration)}", cue="saved")
         elif name == "clip_error":
             self._set_status(f"Clip not saved: {data.get('message', '')}", warn=True)
-            self._show_toast("Clip not saved", theme.DANGER)
+            self._show_toast("Clip not saved", theme.DANGER, cue="error")
         elif name == "rec_started":
             self._set_recording_ui(True, pause=False)
             if self.game_timer_var.get():
                 pos = tuple(self.settings.minibar_position) if self.settings.minibar_position else None
                 self.minibar = MiniBar(self.root, self._toggle_pause, self._toggle_record, pos, capture.virtual_screen(),
                                        self._minibar_moved, self._exclude if IS_WINDOWS else None, self.scale,
-                                       show_pause=False)
+                                       show_pause=False, visible=not self._fullscreen_game())
             self._set_status("Recording…")
-            self._show_toast("Recording", theme.DANGER)
+            self._show_toast("Recording", theme.DANGER, cue="start")
         elif name == "rec_finalizing":
             if self.minibar:
                 self.minibar.set_saving()
@@ -1189,7 +1216,7 @@ class App:
                 if result.warnings:
                     self.warn_label.configure(text="Note: " + "  ".join(result.warnings))
                     self.warn_label.grid(row=3, column=0, sticky="w", pady=(4, 0))
-                self._show_toast(f"Recording saved  ·  {format_time(result.duration)}")
+                self._show_toast(f"Recording saved  ·  {format_time(result.duration)}", cue="saved")
             else:
                 self._set_status("Recording failed", warn=True)
                 messagebox.showerror("Recording failed", data.get("message", "Unknown error"), parent=self.root)
@@ -1263,7 +1290,8 @@ class App:
             self._restore_main()
             self._restart_monitors()
 
-        if self.countdown_var.get():
+        # No countdown over an exclusive fullscreen game: it couldn't be seen, and it could knock the game out.
+        if self.countdown_var.get() and not self._fullscreen_game():
             center = self._primary_rect()
             self._countdown = Countdown(self.root, 3, center, begin, cancel,
                                         self._exclude if IS_WINDOWS else None, self.scale)
@@ -1315,8 +1343,12 @@ class App:
             return
         self.session = session
         pos = tuple(self.settings.minibar_position) if self.settings.minibar_position else None
+        fullscreen = self._fullscreen_game()
         self.minibar = MiniBar(self.root, self._toggle_pause, self._toggle_record, pos, capture.virtual_screen(),
-                               self._minibar_moved, self._exclude if IS_WINDOWS else None, self.scale)
+                               self._minibar_moved, self._exclude if IS_WINDOWS else None, self.scale,
+                               visible=not fullscreen)
+        if fullscreen:
+            self._cue("start")
         self._set_recording_ui(True)
         if session.warnings:
             self._set_status("Recording  ·  " + "; ".join(session.warnings), warn=True)
@@ -1392,6 +1424,8 @@ class App:
             result: RecordingResult = data["result"]
             self.result = result
             self._finish_session()
+            if self._fullscreen_game():
+                self._cue("saved")
             self._set_status(f"Saved {os.path.basename(result.path)}  ·  {format_size(result.size)}  ·  "
                              f"{format_time(result.duration)}")
             self.result_row.grid(row=2, column=0, sticky="w", pady=(2, 0))
@@ -1407,11 +1441,18 @@ class App:
 
     def _finish_session(self) -> None:
         self.session = None
+        # Checked before the bar goes away, since clicking its stop button makes it the foreground window.
+        elsewhere = IS_WINDOWS and not winapi.foreground_is_ours()
         if self.minibar:
             self.minibar.destroy()
             self.minibar = None
         self._set_recording_ui(False)
-        self._restore_main()
+        if elsewhere:
+            # Stopped with the shortcut from a game or another app: come back on the taskbar, not on top of it.
+            if self.root.state() == "withdrawn":
+                self.root.iconify()
+        else:
+            self._restore_main()
         self._restart_monitors()
 
     def _set_status(self, text: str, warn: bool = False) -> None:
@@ -1426,6 +1467,9 @@ class App:
                 self._handle_event(name, data)
         except queue.Empty:
             pass
+        if IS_WINDOWS and self.minibar and self._tick_count % 5 == 0:
+            # Keep the bar above borderless games, and off exclusive fullscreen ones.
+            self.minibar.set_visible(not winapi.exclusive_fullscreen())
         session = self.session
         if session:
             levels = session.levels()

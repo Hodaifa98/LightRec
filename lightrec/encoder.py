@@ -33,6 +33,11 @@ HW_ENCODERS = (
 ENCODER_LABELS = {"libx264": "CPU (x264)", **dict(HW_ENCODERS)}
 # Constant-quality values for the GPU encoders (lower is better, like crf).
 HW_QUALITY = {"Low": 28, "Medium": 23, "High": 19}
+# Longest fragment of a streamed (replay) video.
+STREAM_FRAGMENT_SECONDS = 0.2
+# Windows' own AAC encoder is about twice as fast as ffmpeg's; the built-in one is the fallback.
+AAC_ENCODERS = ("aac_mf", "aac")
+AUDIO_BITRATE = "192k"
 
 
 class EncodeError(RuntimeError):
@@ -286,6 +291,9 @@ class VideoWriter:
         if fragmented or stream:
             # Every fragment is playable on its own, so a crash (or a cut) never loses the whole file.
             container = ["-f", "mp4", "-movflags", "+frag_keyframe+empty_moov+default_base_moof"]
+            if stream:
+                # Fragments also between keyframes, so a replay save never waits long for the newest moment.
+                container += ["-frag_duration", str(int(STREAM_FRAGMENT_SECONDS * 1_000_000))]
         else:
             container = ["-movflags", "+faststart"]
         target = "pipe:1" if stream else path
@@ -356,6 +364,9 @@ def remux(ffmpeg: str, video: str, output: str, log_path: str) -> None:
         raise EncodeError(f"Finishing the video failed.\n{_tail(log_path)}")
 
 
+_broken_audio: set[tuple[str, str]] = set()
+
+
 def mux(ffmpeg: str, video: str, audio: list[str], output: str, log_path: str) -> None:
     """
     Combine the video with one or more WAV tracks into the output file
@@ -375,16 +386,20 @@ def mux(ffmpeg: str, video: str, audio: list[str], output: str, log_path: str) -
         filters = [["-filter_complex", with_norm], ["-filter_complex", without]]
         mapping = ["-map", "0:v:0", "-map", "[aout]"]
     last_error = ""
-    for flt in filters:
-        args = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", *inputs, *flt, *mapping,
-                "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-shortest", "-movflags", "+faststart", output]
-        with open(log_path, "w", encoding="utf-8") as log:
-            try:
-                code = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=log, timeout=3600,
-                                      **_popen_kwargs()).returncode
-            except (OSError, subprocess.SubprocessError) as exc:
-                raise EncodeError(f"Could not run ffmpeg: {exc}") from exc
-        if code == 0 and os.path.isfile(output) and os.path.getsize(output) > 0:
-            return
-        last_error = _tail(log_path)
+    codecs = [name for name in AAC_ENCODERS if (ffmpeg, name) not in _broken_audio and has_encoder(ffmpeg, name)] or ["aac"]
+    for codec in codecs:
+        for flt in filters:
+            args = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", *inputs, *flt, *mapping, "-c:v", "copy",
+                    "-c:a", codec, "-b:a", AUDIO_BITRATE, "-ar", "48000", "-shortest", "-movflags", "+faststart", output]
+            with open(log_path, "w", encoding="utf-8") as log:
+                try:
+                    code = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=log, timeout=3600,
+                                          **_popen_kwargs()).returncode
+                except (OSError, subprocess.SubprocessError) as exc:
+                    raise EncodeError(f"Could not run ffmpeg: {exc}") from exc
+            if code == 0 and os.path.isfile(output) and os.path.getsize(output) > 0:
+                # Encoders that failed before this one can't run here (Media Foundation is missing on Windows N).
+                _broken_audio.update((ffmpeg, name) for name in codecs[:codecs.index(codec)])
+                return
+            last_error = _tail(log_path)
     raise EncodeError(f"Combining audio and video failed.\n{last_error}")

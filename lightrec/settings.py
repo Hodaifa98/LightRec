@@ -50,6 +50,8 @@ class Settings:
     replay_enabled: bool = False
     replay_seconds: int = 30
     game_timer: bool = True
+    # A quiet beep in place of on-screen notices over exclusive fullscreen games.
+    fullscreen_sound: bool = True
 
     @classmethod
     def load(cls) -> "Settings":

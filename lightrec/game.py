@@ -21,6 +21,8 @@ EventCallback = Callable[[str, dict], None]
 
 # How long a save waits for the fragment that contains the moment you pressed the key.
 SAVE_WAIT = 3.0
+# MP4 sample flag for frames that aren't keyframes.
+SAMPLE_IS_NON_SYNC = 0x10000
 
 
 @dataclass
@@ -211,14 +213,16 @@ def _boxes(buf: bytearray):
         del buf[:size]
 
 
-def _sample_count(moof: bytes) -> int:
+def _fragment_info(moof: bytes) -> tuple[int, bool]:
     """
-    Frames in a fragment, read from its trun box(es)
+    Frames in a fragment and whether it starts with a keyframe, read from its tfhd and trun boxes
     """
     total = 0
+    default_flags: Optional[int] = None
+    first_flags: Optional[int] = None
 
     def walk(data: bytes) -> None:
-        nonlocal total
+        nonlocal total, default_flags, first_flags
         pos = 0
         while pos + 8 <= len(data):
             size, typ = struct.unpack(">I4s", data[pos:pos + 8])
@@ -227,12 +231,28 @@ def _sample_count(moof: bytes) -> int:
             body = data[pos + 8:pos + size]
             if typ in (b"moof", b"traf"):
                 walk(body)
+            elif typ == b"tfhd" and len(body) >= 8:
+                flags = struct.unpack(">I", body[:4])[0] & 0xFFFFFF
+                # Skip base offset, description index, default duration and size to reach the default flags.
+                off = 8 + sum(n for bit, n in ((0x1, 8), (0x2, 4), (0x8, 4), (0x10, 4)) if flags & bit)
+                if flags & 0x20 and len(body) >= off + 4:
+                    default_flags = struct.unpack(">I", body[off:off + 4])[0]
             elif typ == b"trun" and len(body) >= 8:
+                flags = struct.unpack(">I", body[:4])[0] & 0xFFFFFF
+                if total == 0:
+                    off = 12 if flags & 0x1 else 8
+                    if not flags & 0x4 and flags & 0x400:
+                        # Per-sample flags come after the optional duration and size.
+                        off += (4 if flags & 0x100 else 0) + (4 if flags & 0x200 else 0)
+                    if flags & 0x404 and len(body) >= off + 4:
+                        first_flags = struct.unpack(">I", body[off:off + 4])[0]
                 total += struct.unpack(">I", body[4:8])[0]
             pos += size
 
     walk(moof)
-    return total
+    flags = first_flags if first_flags is not None else default_flags
+    # Unknown flags count as a keyframe, like before fragments were cut between keyframes.
+    return total, flags is None or not flags & SAMPLE_IS_NON_SYNC
 
 
 class ReplayBuffer:
@@ -247,8 +267,8 @@ class ReplayBuffer:
         self.init = b""
         self.bytes = 0
         self.error: Optional[str] = None
-        # (start time, duration, moof + mdat).
-        self._frags: deque[tuple[float, float, bytes]] = deque()
+        # (start time, duration, moof + mdat, starts with a keyframe).
+        self._frags: deque[tuple[float, float, bytes, bool]] = deque()
         self._frames = 0
         self._pending: Optional[bytes] = None
         self._lock = threading.Lock()
@@ -278,15 +298,15 @@ class ReplayBuffer:
             self._pending = data
         elif typ == "mdat" and self._pending is not None:
             moof, self._pending = self._pending, None
-            samples = _sample_count(moof)
+            samples, key = _fragment_info(moof)
             start = self._frame_time(self._frames)
             self._frames += samples
             duration = samples / float(self.fps)
             with self._lock:
-                self._frags.append((start, duration, moof + data))
+                self._frags.append((start, duration, moof + data, key))
                 self.bytes += len(moof) + len(data)
-                # Keep a little more than asked so a clip always has its full length.
-                limit = start + duration - self.seconds - 1.5
+                # Keep more than asked so a clip always has its full length back to a keyframe (one a second).
+                limit = start + duration - self.seconds - 2.5
                 while self._frags and self._frags[0][0] + self._frags[0][1] < limit:
                     self.bytes -= len(self._frags[0][2])
                     self._frags.popleft()
@@ -314,14 +334,17 @@ class ReplayBuffer:
         with self._lock:
             frags = [f for f in self._frags if f[0] < until]
             init = self.init
-        if not frags or not init:
+        # A clip has to start on a keyframe: the last one at or before the target, else the first one there is.
+        keys = [i for i, f in enumerate(frags) if f[3]]
+        if not keys or not init:
             return None
-        chosen = frags
+        first = keys[0]
         target = until - seconds
-        for i in range(len(frags) - 1, -1, -1):
+        for i in reversed(keys):
             if frags[i][0] <= target:
-                chosen = frags[i:]
+                first = i
                 break
+        chosen = frags[first:]
         data = init + b"".join(f[2] for f in chosen)
         return data, chosen[0][0], chosen[-1][0] + chosen[-1][1]
 
@@ -330,7 +353,15 @@ class ReplayBuffer:
         Drop everything already saved, so the next clip starts where this one ended
         """
         with self._lock:
-            while self._frags and self._frags[0][0] < when:
+            # Keep the last keyframe before that moment: the next clip overlaps by under a second
+            # rather than losing the frames up to the following keyframe.
+            cut = 0
+            for i, frag in enumerate(self._frags):
+                if frag[0] >= when:
+                    break
+                if frag[3]:
+                    cut = i
+            for _ in range(cut):
                 self.bytes -= len(self._frags[0][2])
                 self._frags.popleft()
 
@@ -465,7 +496,7 @@ class GameEngine:
             replay = self.replay
             if replay is None:
                 return
-            # The fragment holding this very moment shows up at the next keyframe, give it a second.
+            # The fragment holding this very moment shows up a fraction of a second later (a fragment's length).
             deadline = pressed + SAVE_WAIT
             while time.perf_counter() < deadline:
                 end = replay.end_time()
@@ -476,7 +507,7 @@ class GameEngine:
             if piece is None:
                 raise encoder.EncodeError("Nothing is buffered yet - give it a second and try again.")
             data, start, end = piece
-            # The buffer starts over after a save, so two presses never save the same moment twice.
+            # The buffer starts over after a save, so the next clip picks up where this one ended.
             replay.forget_before(end)
             stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             os.makedirs(self.config.output_dir, exist_ok=True)

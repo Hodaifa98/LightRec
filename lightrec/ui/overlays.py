@@ -27,6 +27,16 @@ def _exclude(top: tk.Toplevel, exclude: ExcludeFn) -> None:
             pass
 
 
+def _keep_on_top(top: tk.Toplevel) -> None:
+    # Borderless games keep their own window topmost too, so popups have to climb back above it.
+    if IS_WINDOWS:
+        try:
+            from .. import winapi
+            winapi.keep_on_top(winapi.tk_hwnd(top))
+        except Exception:
+            pass
+
+
 class RegionSelector:
     """
     Dimmed full-screen overlay, drag to pick a rectangle
@@ -209,9 +219,11 @@ class MiniBar:
 
     def __init__(self, root: tk.Misc, on_pause: Callable[[], None], on_stop: Callable[[], None],
                  position: Optional[tuple[int, int]], screen: Rect, on_moved: Callable[[int, int], None],
-                 exclude: ExcludeFn = None, scale: float = 1.0, show_pause: bool = True):
+                 exclude: ExcludeFn = None, scale: float = 1.0, show_pause: bool = True, visible: bool = True):
         self.on_moved = on_moved
         top = self.top = tk.Toplevel(root)
+        # Hidden until it is in place.
+        top.withdraw()
         top.overrideredirect(True)
         top.attributes("-topmost", True)
         frame = tk.Frame(top, bg=theme.PANEL, highlightbackground=theme.BORDER, highlightthickness=1,
@@ -244,6 +256,8 @@ class MiniBar:
         _exclude(top, exclude)
         self._drag = None
         self._blink = True
+        if visible:
+            top.deiconify()
 
     def _drag_start(self, e):
         self._drag = (e.x_root - self.top.winfo_x(), e.y_root - self.top.winfo_y())
@@ -280,6 +294,21 @@ class MiniBar:
         self.dot._color = theme.ACCENT
         self.dot._draw()
 
+    def set_visible(self, visible: bool) -> None:
+        """
+        Show or hide the bar; showing also puts it back on top
+        """
+        try:
+            hidden = self.top.state() == "withdrawn"
+            if visible and hidden:
+                self.top.deiconify()
+            elif not visible and not hidden:
+                self.top.withdraw()
+        except tk.TclError:
+            return
+        if visible:
+            _keep_on_top(self.top)
+
     def destroy(self) -> None:
         try:
             self.top.destroy()
@@ -295,6 +324,8 @@ class Toast:
     def __init__(self, root: tk.Misc, text: str, screen: Rect, exclude: ExcludeFn = None, scale: float = 1.0,
                  duration_ms: int = 2600, color: str = theme.OK):
         top = self.top = tk.Toplevel(root)
+        # Hidden until it can't take the focus, so it never pulls a game out of the foreground.
+        top.withdraw()
         top.overrideredirect(True)
         top.attributes("-topmost", True)
         frame = tk.Frame(top, bg=theme.PANEL, highlightbackground=theme.BORDER, highlightthickness=1,
@@ -315,10 +346,22 @@ class Toast:
                 winapi.make_passive(winapi.tk_hwnd(top))
             except Exception:
                 pass
-        top.after(duration_ms, self.destroy)
+        top.deiconify()
+        self._close_job = top.after(duration_ms, self.destroy)
+        self._raise_job = ""
+        self._keep_raised()
+
+    def _keep_raised(self) -> None:
+        _keep_on_top(self.top)
+        self._raise_job = self.top.after(250, self._keep_raised)
 
     def destroy(self) -> None:
         try:
+            # A pending callback on a destroyed window would end in a Tcl error.
+            for job in (self._close_job, self._raise_job):
+                if job:
+                    self.top.after_cancel(job)
+            self._close_job = self._raise_job = ""
             self.top.destroy()
         except tk.TclError:
             pass

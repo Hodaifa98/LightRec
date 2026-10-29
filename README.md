@@ -62,8 +62,10 @@ the middle of a match changes nothing**.
 
 - **Instant replay.** Tick *Keep the last 30 s of gameplay ready to save* and play. When something
   happens, press `Ctrl+Shift+S` and the clip lands in your folder as a `.mp4`, with a small notice in
-  the corner confirming it. Each save empties the buffer, so pressing again five seconds later gives
-  you a five-second clip, not the same thirty seconds twice. Choose 15 s, 30 s, 1 min or 2 min.
+  the corner confirming it. Nothing can be drawn over a game in exclusive fullscreen, so there a quiet
+  beep confirms it instead (you can turn it off). Each save empties the buffer, so pressing again five
+  seconds later gives you a five-second clip, not the same thirty seconds twice. Choose 15 s, 30 s,
+  1 min or 2 min.
 - **Long sessions.** `Ctrl+Shift+R` records for as long as you like. Instant replay keeps working
   while a session records, both fed by one capture.
 - **GPU encoding.** LightRec test-encodes with NVIDIA NVENC, AMD AMF and Intel Quick Sync on first
@@ -124,8 +126,8 @@ read-only), so a copy on a USB stick keeps its preferences.
 | LightRec's own windows / Notes | Excluded from capture by the OS (`WDA_EXCLUDEFROMCAPTURE`, Windows 10 2004+) | Visible if inside the recorded area; "Hide LightRec while recording" is on by default |
 | Microphone | WASAPI via `pyaudiowpatch` (falls back to `sounddevice`) | `sounddevice` |
 | System audio | WASAPI loopback via `pyaudiowpatch` | PulseAudio / PipeWire monitor sources (Linux, needs `pactl`); a virtual device such as BlackHole on macOS |
-| Encoding | `ffmpeg` (libx264 + AAC), frames piped as raw BGRA; gamer mode uses `h264_nvenc` / `h264_amf` / `h264_qsv` when a quick test encode succeeds | same |
-| Instant replay | ffmpeg writes a fragmented MP4 to a pipe with a keyframe every second; LightRec keeps the last fragments in memory, and a clip is just the header plus the chosen fragments remuxed (no re-encoding). Audio sits in a matching PCM ring buffer | same |
+| Encoding | `ffmpeg` (libx264 + AAC through Media Foundation's `aac_mf`, ffmpeg's own `aac` as the fallback), frames piped as raw BGRA; gamer mode uses `h264_nvenc` / `h264_amf` / `h264_qsv` when a quick test encode succeeds | same, with ffmpeg's own `aac` |
+| Instant replay | ffmpeg writes a fragmented MP4 to a pipe, a fragment every 0.2 s and a keyframe every second; LightRec keeps the last fragments in memory, and a clip is just the header plus the fragments from a keyframe on, remuxed (no re-encoding). Audio sits in a matching PCM ring buffer | same |
 | Tray icon | `Shell_NotifyIcon` via `ctypes`, no extra packages | not available (the window minimizes instead) |
 
 Frames are paced against the wall clock (late frames are duplicated, never dropped silently) and
